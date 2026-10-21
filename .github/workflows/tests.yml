@@ -1,0 +1,48 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-14]
+        python-version: ['3.10', '3.12', '3.14']
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Linux file activity dependency
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes lsof
+
+      - name: Install build tooling
+        run: python -m pip install --upgrade pip build
+
+      - name: Run tests and verification
+        run: bash Scripts/verify.sh
+
+      - name: Build source and wheel distributions
+        run: python -m build
+
+      - name: Smoke test installed wheel
+        run: python Scripts/package_smoke.py dist/*.whl --sdist dist/*.tar.gz
+
+      - name: Run synthetic round-trip check
+        run: python Scripts/roundtrip_check.py

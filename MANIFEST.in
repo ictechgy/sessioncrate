@@ -1,0 +1,27 @@
+include LICENSE
+include README.md
+include README.ko.md
+include SPEC.md
+include MULTITOOL_PLAN.md
+include AGENTS.md
+include CONTRIBUTING.md
+include SECURITY.md
+include CODE_OF_CONDUCT.md
+
+graft codex_vault
+graft Scripts
+graft bin
+graft skills
+graft tests
+graft docs
+recursive-include .github *.yml
+
+prune reviews
+prune build
+prune dist
+prune .venv
+prune .git
+
+global-exclude __pycache__
+global-exclude *.py[cod]
+global-exclude .DS_Store

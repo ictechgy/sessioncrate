@@ -13,9 +13,14 @@ import sys
 import tempfile
 import uuid
 
+try:
+    from compression import zstd
+except ImportError:
+    zstd = None
+
 
 ROOT = Path(__file__).resolve().parents[1]
-TOOLS = ('codex', 'claude', 'grok', 'gemini', 'agy', 'glm', 'opencode', 'export')
+TOOLS = ('codex', 'claude', 'grok', 'gemini', 'zcode', 'autoclaw', 'agy', 'glm', 'opencode', 'export')
 OLD_NS = 1_700_000_000_123456789
 
 
@@ -52,14 +57,18 @@ def fixture(root, tool, rng):
         markers.append((marker, f'도구결과 {sid}'))
         if tool == 'codex':
             relative = f'{"sessions" if index == 0 else "archived_sessions"}/한글 경로/rollout-{sid}.jsonl'
-            write(root / relative, jsonl([
+            payload = jsonl([
                 {'type': 'session_meta', 'payload': {'id': sid, 'cwd': '/synthetic/project',
                  'timestamp': '2023-11-14T00:00:00Z', 'cli_version': 'synthetic'}},
                 {'type': 'response_item', 'payload': {'type': 'message', 'role': 'user',
                  'content': [{'type': 'input_text', 'text': marker + ' emoji 🧪 Straße'}]}},
                 {'type': 'response_item', 'payload': {'type': 'function_call_output',
                  'call_id': sid, 'output': output}},
-            ]), 0o640 if index else 0o400)
+            ]).encode()
+            if index == 1 and zstd is not None:
+                relative += '.zst'
+                payload = zstd.compress(payload)
+            write(root / relative, payload, 0o640 if index else 0o400)
         elif tool == 'claude':
             project = root / 'projects' / '-synthetic-project'
             write(project / f'{sid}.jsonl', jsonl([{'type': 'user', 'sessionId': sid,
@@ -84,6 +93,12 @@ def fixture(root, tool, rng):
                     {'type': 'user', 'content': marker},
                     {'type': 'gemini', 'content': '', 'toolCalls': [{'name': 'run_shell_command', 'resultDisplay': output}]},
                 ]}, ensure_ascii=False))
+        elif tool in ('zcode', 'autoclaw'):
+            write(root / f'model-io-sess-{sid}.jsonl', jsonl([
+                {'type': 'model_io', 'sessionId': sid,
+                 'request': {'messages': [{'role': 'user', 'content': marker}]},
+                 'response': {'text': output}},
+            ]))
         elif tool in ('glm', 'opencode'):
             write(root / f'한글 exports/{sid}.json', json.dumps({
                 'info': {'id': sid, 'cwd': '/synthetic/project'}, 'messages': [
@@ -200,15 +215,17 @@ def exercise(seed):
                              'raw_bytes': raw_bytes, 'pruned_and_restored': True})
         verified = cli('verify')
         costs = cli('stats')
-        check('all archives verify after every roundtrip', verified['ok'] and verified['count'] == 16)
+        session_count = 2 * len(TOOLS)
+        check('all archives verify after every roundtrip', verified['ok'] and verified['count'] == session_count)
         check('all original source bytes counted after restoration', costs['source_bytes_retained'] == retained_total)
         check('current managed cost includes retained originals',
               costs['net_storage_bytes'] == costs['vault_bytes'] + retained_total)
-        check('no duplicate archive versions after repeated roundtrips', costs['archive_count'] == 16)
+        check('no duplicate archive versions after repeated roundtrips', costs['archive_count'] == session_count)
         check('normal restore leaves no plaintext stage', not list(base.rglob('.codex-vault-restore-stage-*')))
         return {'ok': True, 'fixture_only': True, 'python': sys.version.split()[0],
                 'platform': sys.platform, 'seed': seed, 'tools': outcomes,
-                'sessions': 16, 'files': file_count, 'checks_passed': len(checks),
+                'sessions': session_count, 'files': file_count, 'checks_passed': len(checks),
+                'codex_zstd_covered': zstd is not None,
                 'cli_commands': command_count, 'raw_bytes': raw_total,
                 'vault_bytes_including_metadata': costs['vault_bytes'],
                 'logical_reduction_percent_after_prune': round(100 * (1 - costs['vault_bytes'] / raw_total), 2),

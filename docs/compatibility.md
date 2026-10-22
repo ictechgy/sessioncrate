@@ -6,11 +6,12 @@ SessionCrate is early alpha. Byte preservation, adapter parsing and native appli
 | --- | --- | --- |
 | macOS CLI | Local Python 3.12/3.14 unit, subprocess, real-`lsof`, install and synthetic roundtrip checks | Not a guarantee for every filesystem or concurrent actor |
 | Linux CLI | The hosted workflow includes Ubuntu jobs | Check the [CI result](https://github.com/ictechgy/sessioncrate/actions/workflows/tests.yml) for the commit in use |
-| Python 3.10+ | Declared runtime minimum; CI includes 3.10, 3.12 and 3.14 | Local runs cover 3.12/3.14; other versions depend on hosted CI evidence |
-| Codex | Synthetic rollout archive/search/verify/restore; Codex CLI 0.163.0 reads legacy EventMsg user/assistant history before and after restoration in an offline sandbox | No Codex application version is certified for resume or all pagination layouts |
+| Python 3.10+ | Declared runtime minimum; CI includes 3.10, 3.12 and 3.14 | Local runs cover 3.12/3.14; other versions depend on hosted CI evidence. New `.jsonl.zst` archive/search/show needs Python 3.14's standard-library Zstandard reader; byte-preserving scan/list/stats/verify/restore/prune remains available on supported older versions |
+| Codex | Synthetic rollout archive/search/verify/restore for plain and `.jsonl.zst` rollout files; Codex CLI 0.163.0 reads legacy EventMsg user/assistant history before and after restoration in an offline sandbox | No Codex application version is certified for resume or all pagination layouts. `.jsonl.zst` source bytes are retained exactly and are not promised to yield additional compression savings |
 | Claude Code CLI | Synthetic main/subagent/tool-result groups, binary-safe restoration | No Claude application version is certified for sidebar/resume |
 | Grok Build | Synthetic full-directory groups and known ACP text shapes | Parsing is best effort; native resume is unverified |
 | Gemini CLI | Synthetic chat JSON, including tool-call results | Native resume is unverified; oversized JSON is skipped by search |
+| Zcode / AutoClaw diagnostics | Synthetic request-response `model-io-*.jsonl` logs in an explicitly selected flat `rollout`/`debug` directory; both labels accept the Zcode bundled layout | Diagnostic logs may contain deltas, resets, or truncated history. Exact log-byte archive/restore is supported; canonical session restore and application resume are not. Discovery does not recurse or touch shared databases, indexes, config, or app homes. Search covers request messages/body messages, response text/tool output, and error messages; headers, provider options, and reasoning are excluded |
 | AGY / GLM / OpenCode / generic exports | Explicit fabricated JSON/JSONL/Markdown/text exports | Not native database cleanup or proof of the underlying model |
 
 On 2026-10-17, two generated-session runs on macOS covered 32 sessions, 52 files, 404 CLI subprocess calls and 498 roundtrip assertions across the adapter modes. Fourteen additional independent checks covered open-file protection, conflicts, corrupt blobs and unrelated corrupt manifests. Those fixtures were disposable and did not contain personal history. This is synthetic validation, not native-app compatibility evidence or a real-session compression forecast.
@@ -24,3 +25,5 @@ For each claimed native version, create a new disposable session with that appli
 Record the operating system, filesystem, source layout, supported/refused cases, actual application result and reproducible commands. Do not copy a user's credentials into a test profile or attach real histories. A passing byte-roundtrip is insufficient to mark native resume as certified.
 
 Until that evidence exists, prefer copy-only archiving and test alternate-destination restoration. Removing old records can leave stale application list/index entries even when the archived bytes are intact.
+
+Diagnostic logs need the same caution as any raw application log: they may include secrets, and SessionCrate does not promise universal redaction. Select only a dedicated log directory you have reviewed.

@@ -37,11 +37,97 @@ def _large_integer_digits():
 class SourceAdapterTests(unittest.TestCase):
     def test_catalog_and_default_roots_are_metadata_only(self):
         ids = {item["id"] for item in tool_catalog()}
-        self.assertTrue({"claude", "grok", "gemini", "agy", "glm", "opencode"}.issubset(ids))
+        self.assertTrue({"claude", "grok", "gemini", "agy", "glm", "opencode", "zcode", "autoclaw"}.issubset(ids))
         self.assertIsInstance(default_source_root("claude"), Path)
         self.assertIsNone(default_source_root("agy"))
+        self.assertIsNone(default_source_root("zcode"))
+        self.assertIsNone(default_source_root("autoclaw"))
+        diagnostic = {item["id"]: item for item in tool_catalog() if item["id"] in {"zcode", "autoclaw"}}
+        self.assertEqual({item["mode"] for item in diagnostic.values()}, {"diagnostic"})
+        self.assertEqual({item["default_root"] for item in diagnostic.values()}, {None})
         with mock.patch.dict(os.environ, {"GEMINI_CLI_HOME": "/tmp/gemini-fixture"}, clear=False):
             self.assertEqual(default_source_root("gemini"), Path("/tmp/gemini-fixture/.gemini"))
+
+    def test_diagnostic_discovery_is_flat_scoped_and_marks_symlinks(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "diagnostic-logs"
+            root.mkdir()
+            (root / "model-io-request_1.jsonl").write_text('{"type":"model_io"}\n', encoding="utf-8")
+            (root / ("model-io-" + "x" * 81 + ".jsonl")).write_text("{}\n", encoding="utf-8")
+            (root / "model-io-headers.jsonl").write_text('{"headers":{"Authorization":"secret"}}\n', encoding="utf-8")
+            (root / "config.json").write_text("{}", encoding="utf-8")
+            (root / "store.sqlite").write_bytes(b"SQLite format 3\x00")
+            nested = root / "nested"
+            nested.mkdir()
+            (nested / "model-io-nested.jsonl").write_text("{}\n", encoding="utf-8")
+            outside = Path(temp) / "outside.jsonl"
+            outside.write_text("{}\n", encoding="utf-8")
+            try:
+                (root / "model-io-link.jsonl").symlink_to(outside)
+            except (OSError, NotImplementedError):
+                self.skipTest("symlinks unavailable")
+
+            groups = discover("zcode", root)
+
+            self.assertEqual([group.session_id for group in groups], ["model-io-headers", "model-io-link", "model-io-request_1"])
+            self.assertEqual(groups[0].files, ("model-io-headers.jsonl",))
+            symlink = next(group for group in groups if group.session_id == "model-io-link")
+            self.assertEqual(symlink.files, ())
+            self.assertFalse(symlink.removable)
+            self.assertTrue(any("symlink" in note for note in symlink.notes))
+            self.assertEqual(next(group for group in groups if group.session_id == "model-io-request_1").source_mode, "diagnostic")
+            self.assertFalse(any("nested" in path for group in groups for path in group.files))
+            self.assertFalse(any(path.endswith("config.json") or path.endswith("store.sqlite") for group in groups for path in group.files))
+
+    def test_diagnostic_root_rejects_home_native_roots_and_symlink_components(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp) / "home"
+            home.mkdir()
+            native = home / ".zcode"
+            log_root = native / "cli" / "rollout"
+            log_root.mkdir(parents=True)
+            (log_root / "model-io-safe.jsonl").write_text("{}\n", encoding="utf-8")
+            with mock.patch("codex_vault.sources.Path.home", return_value=home):
+                self.assertEqual(len(discover("zcode", log_root)), 1)
+                self.assertEqual(len(discover("autoclaw", log_root)), 1)
+                for unsafe in (home, native, native / "cli"):
+                    unsafe.mkdir(parents=True, exist_ok=True)
+                    with self.subTest(unsafe=unsafe), self.assertRaisesRegex(VaultError, "diagnostic|home|native"):
+                        discover("zcode", unsafe)
+
+                codex_root = home / ".codex" / "diagnostics"
+                codex_root.mkdir(parents=True)
+                (codex_root / "model-io-codex.jsonl").write_text("{}\n", encoding="utf-8")
+                with self.assertRaisesRegex(VaultError, "native"):
+                    discover("autoclaw", codex_root)
+
+            real_root = Path(temp) / "real-root"
+            real_root.mkdir()
+            linked_parent = Path(temp) / "linked-parent"
+            try:
+                linked_parent.symlink_to(real_root, target_is_directory=True)
+            except (OSError, NotImplementedError):
+                self.skipTest("symlinks unavailable")
+            with self.assertRaisesRegex(VaultError, "symlink"):
+                discover("zcode", linked_parent)
+
+    def test_diagnostic_rejects_relocated_native_root_from_environment(self):
+        with tempfile.TemporaryDirectory() as temp:
+            relocated = Path(temp) / "claude-profile"
+            relocated.mkdir()
+            (relocated / "model-io-live.jsonl").write_text("{}\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(relocated)}, clear=False):
+                with self.assertRaisesRegex(VaultError, "native"):
+                    discover("zcode", relocated)
+
+    def test_diagnostic_relative_validation_is_tool_and_mode_specific(self):
+        self.assertTrue(valid_relative("zcode", "model-io-safe_1.jsonl", "diagnostic"))
+        self.assertTrue(valid_relative("autoclaw", "model-io-safe_1.jsonl", "diagnostic"))
+        self.assertFalse(valid_relative("zcode", "nested/model-io-safe.jsonl", "diagnostic"))
+        self.assertFalse(valid_relative("zcode", "model-io-.jsonl", "diagnostic"))
+        self.assertFalse(valid_relative("zcode", "model-io-safe.json", "diagnostic"))
+        self.assertFalse(valid_relative("agy", "model-io-safe.jsonl", "diagnostic"))
+        self.assertFalse(valid_relative("zcode", "model-io-safe.jsonl", "native"))
 
     def test_claude_group_contains_main_and_all_companions(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -397,6 +483,125 @@ class SourceAdapterTests(unittest.TestCase):
         self.assertTrue(any("tool state output" in record["text"] for record in state if "text" in record))
         chat_list = list(iter_text_records(io.BytesIO(json.dumps([{"role": "user", "content": "list chat"}]).encode()), "common-json"))
         self.assertEqual(chat_list[0]["text"], "list chat")
+
+    def test_model_io_records_extract_known_text_without_dumping_sensitive_fields(self):
+        lines = [
+            {
+                "type": "model_io",
+                "sessionId": "diagnostic-session",
+                "request": {
+                    "messages": [
+                        {"role": "user", "content": "사용자 요청"},
+                        {"role": "assistant", "content": [{"type": "text", "text": "응답 준비"}]},
+                        {"role": "assistant", "reasoning": "private reasoning", "headers": {"Authorization": "secret"}, "content": [
+                            {"type": "reasoning", "text": "hidden reasoning block"},
+                            {"type": "thinking", "text": "hidden thinking block"},
+                            {"type": "analysis", "text": "hidden analysis block"},
+                            {"type": "redacted-thinking", "text": "hidden redacted block"},
+                            {"type": "text", "text": "visible next to private blocks"},
+                            {"type": "input_image", "data": "binary-media"},
+                        ]},
+                    ],
+                    "providerOptions": {"apiKey": "secret"},
+                },
+                "response": {
+                    "text": "모델 응답",
+                    "toolCalls": [
+                        {"type": "thinking", "text": "private tool thinking"},
+                        {"name": "read_file", "arguments": {"path": "src/한글.txt"}},
+                    ],
+                    "toolResults": [
+                        {"type": "analysis", "text": "private tool analysis"},
+                        {"name": "read_file", "result": {"output": "파일 결과"}},
+                    ],
+                    "reasoning": "private response reasoning",
+                    "headers": {"Authorization": "secret"},
+                },
+                "error": {"message": "top-level error"},
+            },
+            {
+                "type": "model_io",
+                "request": {"sdkMessages": {"role": "user", "content": "SDK 메시지"}},
+                "response": {"toolResults": [{"resultDisplay": "SDK 도구 결과"}]},
+            },
+            {
+                "type": "model_io",
+                "request": {"body": json.dumps({"messages": [{"role": "user", "content": "문자열 body"}]})},
+                "response": {"text": "body 응답"},
+            },
+            {"type": "model_io", "request": {"body": {"messages": {"role": "user", "content": "dict body"}}}},
+            {"type": "model_io", "error": {"message": "오류 메시지"}},
+            {"type": "model_io", "body": {"messages": [{"role": "user", "content": "최상위 body는 무시"}]}},
+            {"type": "modelIOReset", "sessionId": "reset-only"},
+        ]
+        data = b"\n".join(json.dumps(line, ensure_ascii=False).encode() for line in lines) + b"\n"
+
+        records = list(iter_text_records(io.BytesIO(data), "model-io-jsonl"))
+        texts = [record["text"] for record in records if "text" in record]
+
+        for expected in ("사용자 요청", "응답 준비", "visible next to private blocks", "모델 응답", "read_file", "src/한글.txt", "파일 결과", "SDK 메시지", "SDK 도구 결과", "문자열 body", "body 응답", "dict body", "오류 메시지"):
+            self.assertTrue(any(expected in text for text in texts), expected)
+        self.assertNotIn("최상위 body는 무시", " ".join(texts))
+        self.assertNotIn("private reasoning", " ".join(texts))
+        self.assertNotIn("hidden reasoning block", " ".join(texts))
+        self.assertNotIn("hidden thinking block", " ".join(texts))
+        self.assertNotIn("hidden analysis block", " ".join(texts))
+        self.assertNotIn("hidden redacted block", " ".join(texts))
+        self.assertNotIn("private tool thinking", " ".join(texts))
+        self.assertNotIn("private tool analysis", " ".join(texts))
+        self.assertNotIn("secret", " ".join(texts))
+        self.assertNotIn("binary-media", " ".join(texts))
+        self.assertEqual(records[-1], {"line": 7, "skipped": True, "reason": "no readable text"})
+
+    def test_model_io_delta_records_are_independent_and_unknown_shapes_are_skipped(self):
+        lines = [
+            {"type": "model_io", "request": {"messages": [{"content": "first delta"}]}},
+            {"type": "model_io", "request": {"messages": [{"content": "second delta"}]}},
+            {"type": "model_io_delta", "text": "must not be reconstructed"},
+            {"type": "other", "request": {"messages": [{"content": "unknown"}]}},
+        ]
+        data = b"\n".join(json.dumps(line).encode() for line in lines) + b"\n"
+
+        records = list(iter_text_records(io.BytesIO(data), "model-io-jsonl"))
+        texts = [record["text"] for record in records if "text" in record]
+
+        self.assertEqual(texts, ["first delta", "second delta"])
+        self.assertEqual(records[2]["reason"], "no readable text")
+        self.assertEqual(records[3]["reason"], "no readable text")
+
+    def test_model_io_combines_concurrent_request_views_and_tail_tool_results(self):
+        line = {
+            "type": "model_io",
+            "request": {
+                "messages": [{"content": "common"}, {"content": "message-only"}],
+                "sdkMessages": [{"content": "common"}, {"content": "sdk-only"}],
+                "body": {"messages": [{"content": "common"}, {"content": "body-only"}]},
+            },
+            "response": {
+                "text": "response text",
+                "toolCalls": [{"name": "read_file", "arguments": {"path": "common"}}],
+                "toolResults": [],
+            },
+            "toolResults": [{"result": "tail-only tool result"}],
+        }
+
+        records = list(iter_text_records(io.BytesIO((json.dumps(line) + "\n").encode()), "model-io-jsonl"))
+        self.assertEqual(len(records), 1)
+        self.assertEqual(
+            records[0]["text"],
+            "common message-only sdk-only body-only response text read_file tail-only tool result",
+        )
+
+    def test_model_io_metadata_reads_only_display_scalars(self):
+        data = b"\n".join([
+            json.dumps({"type": "model_io", "sessionId": "model-session", "startedAt": "2026-10-23T00:00:00Z", "request": {"messages": [{"content": "text"}]}}).encode(),
+            json.dumps({"type": "model_io", "sessionId": "later", "startedAt": "later"}).encode(),
+        ]) + b"\n"
+
+        self.assertEqual(
+            metadata_from_bytes(data, "model-io-jsonl"),
+            {"session_id": "model-session", "started_at": "2026-10-23T00:00:00Z"},
+        )
 
     def test_grok_skips_private_updates_in_string_and_object_shapes(self):
         lines = [

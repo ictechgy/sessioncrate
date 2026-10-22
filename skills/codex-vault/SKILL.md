@@ -1,6 +1,6 @@
 ---
 name: codex-vault
-description: Compress, search and restore local AI coding session records. Use for Codex, Claude Code, Grok Build and Gemini histories, or explicitly provided AGY, GLM and OpenCode session exports.
+description: Compress, search and restore local AI coding session records. Use for Codex, Claude Code, Grok Build and Gemini histories, explicit Zcode/AutoClaw diagnostic logs, or AGY, GLM and OpenCode session exports.
 ---
 
 # Codex Session Vault (legacy alias)
@@ -9,7 +9,9 @@ The public project and primary command are now SessionCrate (`sessioncrate`). Th
 
 Use this skill's `scripts/codex-vault` Python helper, resolving its path relative to this `SKILL.md`. Run it with `python3`; it works outside the project directory and has no runtime network access.
 
-The CLI defaults to Codex for scan/archive and to all tools for list/search/verify. Use `tools --json` to inspect supported source modes and defaults. Select `--tool claude|grok|gemini` for native local histories; use `--source-root` to override the tool home. AGY, GLM, OpenCode and generic export adapters require `--source-root` pointing to an explicit session-export directory. Never substitute a native database/account/config directory for an export root. AGY native SQLite has no supported file export contract here; do not invent an export command or claim that export-file pruning shrinks the original application's database.
+The CLI defaults to Codex for scan/archive and to all tools for list/search/verify. Use `tools --json` to inspect supported source modes and defaults. Select `--tool claude|grok|gemini` for native local histories; use `--source-root` to override the tool home. Codex rollout files may be plain `.jsonl` or `.jsonl.zst`. New `.jsonl.zst` archive/search/show operations need Python 3.14 or later for the standard-library Zstandard reader; scan/list/stats/verify/restore/prune can preserve their bytes on supported older Python versions and report a capability error when decoding is required. AGY, GLM, OpenCode and generic export adapters require `--source-root` pointing to an explicit session-export directory. Never substitute a native database/account/config directory for an export root. AGY native SQLite has no supported file export contract here; do not invent an export command or claim that export-file pruning shrinks the original application's database.
+
+`zcode` and `autoclaw` are explicit diagnostic-log modes, not native app-home adapters. Pass `--source-root` for one flat `.../.zcode/cli/rollout` or `.../.zcode/cli/debug` directory. Both labels accept that Zcode bundled layout. Only direct regular files named `model-io-*.jsonl` are selected; there is no recursion and no shared database, index, config, or app-home discovery. These logs can contain deltas, resets, or truncated history, so they are exact log-byte archives rather than canonical session or application-resume records. Search reads request `messages`, `sdkMessages`, or `body.messages`, response text/tool output, and `error.message`; headers, provider options, and reasoning are excluded. Raw logs may contain secrets, so do not promise universal redaction.
 
 Export discovery excludes hidden paths and credential/key/account files, and rejects known native roots and native layout signatures. Keep exports in their own directory; do not work around these guards by relabeling a native store.
 
@@ -25,4 +27,4 @@ If `list` reports manifest `errors`, retain the valid archive entries and report
 
 Report storage using `stats --json`. Copy-only archiving increases current disk usage; savings begin after verified originals are removed. Include the vault's blob and manifest overhead when discussing net savings.
 
-Global databases, indexes, credentials, config, project files and worktrees are not changed. Native application resume or sidebar behavior after restoration has not been validated; byte-exact restore and vault search are the supported contract. Do not claim reduced model tokens from disk compression. Native Claude/Grok archives include session companions; binary or oversized members remain archived but search reports skips.
+Global databases, indexes, credentials, config, project files and worktrees are not changed. Native application resume or sidebar behavior after restoration has not been validated; byte-exact restore and vault search are the supported contract. Do not claim reduced model tokens from disk compression. Native Claude/Grok archives include session companions; binary or oversized members remain archived but search reports skips. For `.jsonl.zst`, the original compressed bytes are hashed and retained exactly; the decoded byte count is manifest metadata for search consistency, not a second plaintext transcript or an additional compression-savings claim.

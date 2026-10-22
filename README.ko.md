@@ -23,6 +23,8 @@ sessioncrate tools
 
 설치 전 체크아웃에서 바로 실행하려면 `python3 bin/sessioncrate`를 사용할 수 있습니다. Python 3.10 이상이 필요합니다. 원본 제거에는 `lsof`가 추가로 필요하지만, 압축·검색·검증·복원에는 필요하지 않습니다. 별도로 설치할 Python 런타임 패키지는 없으며 PyPI에는 아직 게시하지 않았습니다.
 
+Codex `.jsonl.zst`의 신규 보관·검색·내용 보기에는 Python 3.14 이상이 필요합니다. 메타데이터 스캔과 이미 보관한 압축 원본의 바이트 검증·복원·안전 검사 후 제거는 이전 지원 버전에서도 동작합니다.
+
 개인 기록을 선택하기 전에 삭제해도 되는 임시 데이터로 먼저 실행하세요.
 
 ```bash
@@ -63,10 +65,12 @@ sessioncrate tools
 
 | `--tool` | 입력 방식 | 보관 범위 |
 | --- | --- | --- |
-| `codex` | Codex CLI 로컬 rollout JSONL | `sessions/`와 `archived_sessions/`의 rollout 파일 |
+| `codex` | Codex CLI 로컬 rollout JSONL 및 `.jsonl.zst` | `sessions/`와 `archived_sessions/`의 rollout 파일. 압축된 rollout 원본 바이트도 그대로 보존 |
 | `claude` | Claude Code CLI 로컬 기록 | 프로젝트 main JSONL과 같은 세션의 companion 파일, subagent·tool result 포함 |
 | `grok` | Grok Build 로컬 세션 폴더 | `sessions/<project>/<session>/` 전체 묶음. ACP 해석은 best effort |
 | `gemini` | Gemini CLI 로컬 chat JSON | `tmp/<project>/chats/session-*.json` |
+| `zcode` | 명시적으로 지정한 Zcode model-I/O 진단 로그 | 선택한 `rollout` 또는 `debug` 폴더 바로 아래의 일반 파일 `model-io-*.jsonl` |
+| `autoclaw` | 명시적으로 지정한 model-I/O 진단 로그 | 같은 Zcode 진단 폴더 구조를 선택할 수 있음. 앱 홈을 자동 탐색하지 않음 |
 | `agy` | 명시적 텍스트 export | JSON, JSONL, Markdown, 텍스트. Antigravity 내부 SQLite는 지원하지 않음 |
 | `glm` | 명시적 텍스트 export | 사용자가 지정한 출처 라벨이며 native 저장 형식이 아님 |
 | `opencode` | 명시적 export | OpenCode JSON·텍스트 export. 공유 native DB는 건드리지 않음 |
@@ -80,9 +84,14 @@ sessioncrate archive --tool grok --older-than 30 --execute
 sessioncrate archive --tool gemini --older-than 30 --execute
 sessioncrate archive --tool glm --source-root /path/to/session-exports --execute
 sessioncrate archive --tool agy --source-root /path/to/session-exports/agy --execute
+sessioncrate archive --tool zcode --source-root /path/to/.zcode/cli/rollout --execute
 ```
 
-export 어댑터에 사용자 홈, native 계정 폴더, 데이터베이스, 설정 폴더를 지정하지 마세요. 숨김 경로와 알려진 인증·설정 파일은 제외하고, native 저장 구조로 판별되는 경로는 거부합니다. export 정리는 지정한 export 파일의 공간만 회수하며 원래 도구의 데이터베이스 용량은 줄이지 않습니다. Claude Desktop과 Cowork는 native Claude 어댑터의 범위 밖입니다.
+export 어댑터에는 전용 export 폴더를 지정하세요. 알려진 사용자 홈·native 계정·데이터베이스·설정 경로는 거부하고 숨김 경로와 알려진 인증·설정 파일은 제외합니다. export 정리는 지정한 export 파일의 공간만 회수하며 원래 도구의 데이터베이스 용량은 줄이지 않습니다. Claude Desktop과 Cowork는 native Claude 어댑터의 범위 밖입니다.
+
+진단 어댑터에는 로그가 직접 들어 있는 폴더를 명시적으로 지정합니다. 그 폴더의 일반 파일 `model-io-*.jsonl`만 선택하며 하위 폴더·DB·인덱스·다른 파일은 보관 범위에 포함하지 않습니다. `zcode`와 `autoclaw` 모두 `.../.zcode/cli/rollout` 또는 `.../.zcode/cli/debug`를 사용할 수 있고, 앱 홈을 자동 탐색하지 않습니다.
+
+Zcode와 AutoClaw 파일은 요청·응답 진단 로그입니다. 로그에는 delta·reset·중간에 잘린 기록이 섞일 수 있으므로, 정확한 로그 바이트를 백업하는 기능이며 완전한 세션 이력이나 애플리케이션 재개 형식으로 간주할 수 없습니다. 검색 대상은 request의 `messages`·`sdkMessages`·`body.messages`, response의 text·tool output, `error.message`입니다. headers·provider options·reasoning 필드는 검색하지 않습니다. 보관된 원본 로그는 비공개 vault에 남지만 비밀값이 들어 있을 수 있으며, 모든 비밀을 자동 제거한다고 보장하지 않습니다.
 
 `scan`과 `archive`의 기본 도구는 Codex입니다. `list`·`search`·`verify`는 기본으로 모든 아카이브 영역을 조회하며, ID 없이 실행한 `prune`은 `--tool`을 지정하지 않는 한 Codex만 대상으로 합니다.
 
@@ -100,6 +109,8 @@ sessioncrate show ARCHIVE_ID --limit 30
 검색은 대소문자를 구분하지 않는 유니코드 문자열 부분 일치입니다. 압축된 아카이브 구성원을 스트리밍으로 읽으며 원문을 복제하는 평문 검색 인덱스를 만들지 않습니다. 결과에는 아카이브 ID, 프로젝트, 원본 구성원 또는 레코드 위치, 제한된 문맥이 표시됩니다. 보관소가 크면 `--project`와 `--session`으로 검색할 아카이브를 좁히세요. `--limit`은 반환 결과 수를 제한합니다. 충분한 결과를 찾았어도 읽기 시작한 아카이브는 끝까지 무결성을 검사하므로 검증 작업량까지 줄어드는 것은 아닙니다.
 
 알 수 없는 형식, 바이너리, 이미지, 암호화 또는 너무 큰 레코드는 검색에서 건너뛸 수 있지만 원본 바이트는 아카이브에 그대로 남습니다. JSONL 한 줄이 1MiB를 넘거나 JSON 문서가 32MiB를 넘으면 해당 텍스트 리더가 건너뛰며, 빈 결과가 중요한 경우 `skipped_records`를 확인하세요. JSON 문서의 `line`은 물리적인 파일 줄이 아니라 메시지 순번입니다.
+
+Codex `.jsonl.zst`는 원래 압축된 소스 바이트를 해시하고 vault 안에 바이트 단위로 보존합니다. 스트리밍 검색의 일관성을 확인하기 위해 해제된 바이트 수만 manifest에 기록하며, 별도의 평문 사본을 만들거나 추가 압축 절약을 약속하지 않습니다. 이 내용을 검색하거나 `show`하려면 Python 3.14 이상이 필요합니다. 낮은 지원 버전에서도 바이트 보존을 위한 scan·list·stats·verify·restore·prune은 사용할 수 있고, 해제가 필요한 작업에는 기능 부족 오류가 명확히 표시됩니다.
 
 ## 검증과 복원
 

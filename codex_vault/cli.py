@@ -13,7 +13,7 @@ def _options(parser, *, subcommand=False):
                         help='Codex data directory (default: CODEX_HOME or ~/.codex)')
     parser.add_argument('--source-root', type=Path, default=fallback,
                         help='Selected tool home, or a directory containing explicit session exports')
-    parser.add_argument('--tool', choices=('codex', 'claude', 'grok', 'gemini', 'agy', 'glm', 'opencode', 'export', 'all'),
+    parser.add_argument('--tool', choices=('codex', 'claude', 'grok', 'gemini', 'zcode', 'autoclaw', 'agy', 'glm', 'opencode', 'export', 'all'),
                         default=fallback, help='Source tool; scan/archive default codex, list/search/stats/verify default all')
     parser.add_argument('--vault', type=Path, default=fallback,
                         help='Private archive directory (default: ~/.local/share/codex-vault)')
@@ -236,6 +236,8 @@ def _run(args, vault):
             raise storage.VaultError('--codex-home is only for Codex; use --source-root for other tools')
         source = args.source_root or args.codex_home or sources.default_source_root(tool)
         if source is None:
+            if tool in ('zcode', 'autoclaw'):
+                raise storage.VaultError(f'{tool} requires --source-root with a dedicated model-io diagnostic log directory')
             raise storage.VaultError(f'{tool} requires --source-root with explicit session exports; native databases are not selected')
         source = source.expanduser().absolute()
         if tool == 'codex':

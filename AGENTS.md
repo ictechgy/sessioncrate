@@ -8,5 +8,6 @@
 - Search compressed files as streams; do not create a second plaintext transcript store. Support Korean and literal substring queries.
 - Work concurrently with explicit file ownership. Preserve other agents' edits.
 - The public command/package is `sessioncrate`. Keep legacy checkout launchers, the `codex_vault` module, archive identity salts/formats and the default `codex-vault` data directory compatible. Do not migrate user archives as part of branding changes.
+- Codex `.jsonl.zst` archives retain the original compressed bytes. Only new archiving/content reading needs Python 3.14; byte verification/restoration must remain decoder-independent. Zcode/AutoClaw adapters select explicit flat diagnostic log directories, never canonical session databases or app homes.
 - `reviews/` contains local development evidence and is excluded from version control and distributions. Public documentation must not include personal paths or real session records.
 - Validate with `bash Scripts/verify.sh`; tests must use temporary directories and meaningful corruption, mutation, traversal and restore-conflict cases.

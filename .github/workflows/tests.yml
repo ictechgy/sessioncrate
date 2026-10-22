@@ -35,6 +35,10 @@ jobs:
       - name: Install build tooling
         run: python -m pip install --upgrade pip build
 
+      - name: Require standard-library Zstandard on Python 3.14
+        if: matrix.python-version == '3.14'
+        run: python -c "from compression import zstd; assert zstd.decompress(zstd.compress(b'fixture')) == b'fixture'"
+
       - name: Run tests and verification
         run: bash Scripts/verify.sh
 

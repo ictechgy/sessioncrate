@@ -1443,6 +1443,32 @@ class BundleTests(unittest.TestCase):
         self.assertEqual(result["bundle_net_storage_bytes"], result["bundle_vault_bytes"] + len(payload))
         self.assertGreater(result["bundle_allocated_bytes"], 0)
 
+    def test_diagnostic_manifest_cannot_expand_log_scope_or_use_generic_reader(self) -> None:
+        relative = "model-io-sess-boundary.jsonl"
+        self._group("zcode", Path(relative).stem, {relative: b'{"type":"model_io"}\n'},
+                    formats={relative: "model-io-jsonl"}, source_mode="diagnostic")
+        manifest = bundles.archive("zcode", self.source, self.vault, older_than_days=1, execute=True)["archived"][0]
+        self.assertTrue(bundles.verify(self.vault, manifest["archive_id"])["ok"])
+        for mutation in ("reader", "nested", "tool", "mode", "log_id", "directory"):
+            with self.subTest(mutation=mutation):
+                changed = json.loads(json.dumps(manifest))
+                if mutation == "reader":
+                    changed["files"][0]["format"] = "generic-jsonl"
+                elif mutation == "nested":
+                    changed["files"][0]["path"] = "nested/" + relative
+                    changed["root_entries"] = ["nested/" + relative]
+                elif mutation == "tool":
+                    changed["tool"] = "export"
+                elif mutation == "mode":
+                    changed["source_mode"] = "native"
+                elif mutation == "log_id":
+                    changed["session_id"] = "another-log"
+                else:
+                    changed["directories"] = [{"path": "unrelated", "mode": 0o700, "mtime_ns": 1}]
+                changed["archive_id"] = bundles._compute_archive_id(changed)
+                with self.assertRaises(VaultError):
+                    bundles._validate_manifest(changed)
+
 
 class BundleRealAdapterTests(unittest.TestCase):
     def test_empty_grok_group_does_not_block_valid_group_scan_or_archive(self) -> None:

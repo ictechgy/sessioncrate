@@ -195,6 +195,8 @@ def _iter_readable(vault_dir: Path, manifest: dict) -> Iterator[tuple[int, str, 
         # VaultError. Normalize its blob-read diagnostic so callers receive a
         # stable, transcript-free search error.
         storage_message = str(error).casefold()
+        if "zstandard" in storage_message:
+            raise
         if ("cannot read archive blob" in storage_message or "gzip" in storage_message
                 or "corrupt" in storage_message or "truncated" in storage_message):
             raise VaultError(f"archive {archive_id} has corrupt gzip data") from error

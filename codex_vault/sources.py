@@ -23,6 +23,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Iterator
 from urllib.parse import unquote
 
+from . import storage
 from .storage import VaultError
 
 
@@ -36,7 +37,19 @@ _CREDENTIAL_NAMES = {
 _EXPORT_EXTENSIONS = (".json", ".jsonl", ".md", ".markdown", ".txt")
 _EXPORT_TOOLS = {"agy", "glm", "opencode", "export"}
 _NATIVE_TOOLS = {"claude", "grok", "gemini", "codex"}
-_NATIVE_ROOT_NAMES = {".claude", ".grok", ".gemini", ".codex"}
+_DIAGNOSTIC_TOOLS = {"zcode", "autoclaw"}
+_DIAGNOSTIC_FILENAME = re.compile(r"model-io-[A-Za-z0-9_-]{1,80}\.jsonl\Z")
+_DIAGNOSTIC_APP_ROOTS = {
+    "zcode": {".zcode"},
+    # AutoClaw may write through the same Zcode diagnostic profile. The tool
+    # label alone does not establish which app owns an explicitly selected log.
+    "autoclaw": {".zcode"},
+}
+_DIAGNOSTIC_LOG_LEAVES = {"rollout", "debug"}
+_NATIVE_ROOT_NAMES = {".claude", ".grok", ".gemini", ".codex", ".zcode", ".autoclaw", ".auto-claw"}
+_MODEL_IO_HIDDEN_CONTENT_KINDS = {
+    "reasoning", "thinking", "analysis", "redacted_thinking", "redacted-thinking",
+}
 _CREDENTIAL_TOKEN = re.compile(r"(?:^|[._-])(credentials?|oauth|tokens?|secrets?|accounts?|api[_-]?keys?)(?:$|[._-])", re.IGNORECASE)
 
 
@@ -65,14 +78,14 @@ def default_source_root(tool: str) -> Path | None:
         return (Path(gemini_home).expanduser() / ".gemini") if gemini_home else Path.home() / ".gemini"
     if tool == "codex":
         return Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
-    if tool in _EXPORT_TOOLS:
+    if tool in _EXPORT_TOOLS or tool in _DIAGNOSTIC_TOOLS:
         return None
     raise VaultError(f"unknown source tool: {tool}")
 
 
 def tool_catalog() -> list[dict[str, Any]]:
     return [
-        {"id": "codex", "label": "Codex", "mode": "native", "default_root": str(default_source_root("codex")), "caveat": "Handled by the legacy Codex backend."},
+        {"id": "codex", "label": "Codex", "mode": "native", "default_root": str(default_source_root("codex")), "caveat": "Handled by the legacy backend for plain JSONL and .jsonl.zst; new zstd archive/search/show support requires Python 3.14."},
         {"id": "claude", "label": "Claude Code", "mode": "native", "default_root": str(default_source_root("claude")), "caveat": "CLI transcripts and same-session companions only; Desktop/Cowork excluded."},
         {"id": "grok", "label": "Grok Build", "mode": "native", "default_root": str(default_source_root("grok")), "caveat": "ACP updates parsing is best-effort; native session directories are archived as complete groups."},
         {"id": "gemini", "label": "Gemini CLI", "mode": "native", "default_root": str(default_source_root("gemini")), "caveat": "Only documented tmp/*/chats/session-*.json artifacts are selected."},
@@ -80,6 +93,8 @@ def tool_catalog() -> list[dict[str, Any]]:
         {"id": "glm", "label": "GLM", "mode": "export", "default_root": None, "caveat": "Explicit user-selected export root required."},
         {"id": "opencode", "label": "OpenCode", "mode": "export", "default_root": None, "caveat": "Use JSON/text exports; native shared databases are untouched."},
         {"id": "export", "label": "Generic export", "mode": "export", "default_root": None, "caveat": "Explicit plaintext export root required."},
+        {"id": "zcode", "label": "Zcode diagnostics", "mode": "diagnostic", "default_root": None, "caveat": "Explicit flat model-io diagnostic log directory required; logs are partial diagnostics, not complete or resumable sessions."},
+        {"id": "autoclaw", "label": "AutoClaw diagnostics", "mode": "diagnostic", "default_root": None, "caveat": "Explicit flat model-io diagnostic log directory required; logs are partial diagnostics, not complete or resumable sessions."},
     ]
 
 
@@ -94,7 +109,11 @@ def _parts(path: str) -> tuple[str, ...] | None:
 
 def valid_relative(tool: str, path: str, source_mode: str) -> bool:
     parts = _parts(path)
-    if parts is None or not parts or source_mode not in {"native", "export"}:
+    if parts is None or not parts:
+        return False
+    if source_mode == "diagnostic":
+        return tool in _DIAGNOSTIC_TOOLS and len(parts) == 1 and _DIAGNOSTIC_FILENAME.fullmatch(parts[0]) is not None
+    if source_mode not in {"native", "export"}:
         return False
     if any(_is_forbidden_name(part) for part in parts):
         return False
@@ -214,12 +233,52 @@ def _root(path: Path) -> Path:
     return root
 
 
+def _validate_diagnostic_root(tool: str, root: Path) -> None:
+    """Keep diagnostic discovery inside one explicitly selected flat log dir."""
+    if tool not in _DIAGNOSTIC_TOOLS:
+        raise VaultError("diagnostic source mode is only available for diagnostic tools")
+    if any(part in {".", ".."} for part in root.parts):
+        raise VaultError("diagnostic source root is not canonical")
+    try:
+        storage._check_path_components(root)
+    except VaultError as exc:
+        raise VaultError("diagnostic source root contains a symlink component") from exc
+
+    try:
+        parts = tuple(part.casefold() for part in root.parts)
+        home = Path.home().expanduser()
+    except (OSError, RuntimeError):
+        raise VaultError("diagnostic source root could not be checked")
+
+    if root == home or home.is_relative_to(root):
+        raise VaultError("diagnostic source root cannot be the user home or an ancestor")
+
+    app_roots = _DIAGNOSTIC_APP_ROOTS[tool]
+    for index, part in enumerate(parts):
+        if part not in _NATIVE_ROOT_NAMES:
+            continue
+        suffix = parts[index:]
+        if part in app_roots and len(suffix) == 3 and suffix[1] == "cli" and suffix[2] in _DIAGNOSTIC_LOG_LEAVES:
+            continue
+        raise VaultError("diagnostic source root is a native app root; select its rollout or debug directory")
+
+    candidate = root.resolve()
+    for native in _known_native_roots():
+        if native is None:
+            continue
+        native_path = Path(native).expanduser().resolve()
+        if candidate == native_path or candidate.is_relative_to(native_path) or native_path.is_relative_to(candidate):
+            raise VaultError("diagnostic source root is a native app root; select its rollout or debug directory")
+
+
 def _rel(root: Path, path: Path) -> str:
     return path.relative_to(root).as_posix()
 
 
 def _format_for(path: str, tool: str) -> str:
     lower = path.lower()
+    if tool in _DIAGNOSTIC_TOOLS and _DIAGNOSTIC_FILENAME.fullmatch(path) is not None:
+        return "model-io-jsonl"
     if lower.endswith(".jsonl"):
         if tool == "claude":
             return "claude-jsonl"
@@ -286,7 +345,7 @@ def _group(tool: str, root: Path, session_id: str, files: list[str], roots: list
     )
 
 
-def _unreadable_group(tool: str, root: Path, relative: str, *, cwd: str = "") -> SessionGroup:
+def _unreadable_group(tool: str, root: Path, relative: str, *, cwd: str = "", source_mode: str = "native") -> SessionGroup:
     return _group(
         tool,
         root,
@@ -294,6 +353,7 @@ def _unreadable_group(tool: str, root: Path, relative: str, *, cwd: str = "") ->
         [],
         [relative],
         cwd=cwd,
+        source_mode=source_mode,
         notes=[f"unreadable directory: {relative}"],
     )
 
@@ -430,6 +490,51 @@ def _discover_export(tool: str, root: Path) -> list[SessionGroup]:
     return groups
 
 
+def _discover_diagnostic(tool: str, root: Path) -> list[SessionGroup]:
+    """Discover only direct model-io files in one explicit diagnostic directory."""
+    _validate_diagnostic_root(tool, root)
+    groups: list[SessionGroup] = []
+    try:
+        entries = sorted(os.scandir(root), key=lambda entry: entry.name)
+    except OSError:
+        return [_unreadable_group(tool, root, ".", source_mode="diagnostic")]
+    for entry in entries:
+        if _DIAGNOSTIC_FILENAME.fullmatch(entry.name) is None:
+            continue
+        relative = entry.name
+        try:
+            if entry.is_symlink():
+                groups.append(_group(
+                    tool,
+                    root,
+                    Path(entry.name).stem,
+                    [],
+                    [relative],
+                    source_mode="diagnostic",
+                    notes=[f"symlink diagnostic log: {relative}"],
+                ))
+            elif entry.is_file(follow_symlinks=False):
+                groups.append(_group(
+                    tool,
+                    root,
+                    Path(entry.name).stem,
+                    [relative],
+                    [relative],
+                    source_mode="diagnostic",
+                ))
+        except OSError:
+            groups.append(_group(
+                tool,
+                root,
+                Path(entry.name).stem,
+                [],
+                [relative],
+                source_mode="diagnostic",
+                notes=[f"unreadable diagnostic log: {relative}"],
+            ))
+    return groups
+
+
 def discover(tool: str, source_root: Path) -> list[SessionGroup]:
     """Discover metadata and paths only; no transcript/config bytes are read."""
     root = _root(source_root)
@@ -441,6 +546,8 @@ def discover(tool: str, source_root: Path) -> list[SessionGroup]:
         return _discover_gemini(root)
     if tool == "codex":
         return _discover_codex(root)
+    if tool in _DIAGNOSTIC_TOOLS:
+        return _discover_diagnostic(tool, root)
     if tool in _EXPORT_TOOLS:
         return _discover_export(tool, root)
     raise VaultError(f"unknown source tool: {tool}")
@@ -501,9 +608,176 @@ def _text_parts(value: Any, depth: int = 0) -> list[str]:
     return parts
 
 
+_MODEL_IO_MESSAGE_KEYS = ("text", "content", "parts")
+_MODEL_IO_TOOL_KEYS = {
+    "name", "toolname", "command", "input", "arguments", "rawinput",
+    "output", "result", "resultdisplay", "content", "text", "message",
+    "path", "filepath", "file_path", "code", "description", "status",
+    "stdout", "stderr", "exitcode", "error",
+}
+_MODEL_IO_HIDDEN_KEY_PARTS = (
+    "authorization", "cookie", "credential", "password", "secret", "token",
+    "api_key", "apikey", "provideroption", "reasoning", "header", "binary",
+    "base64", "inlinedata",
+)
+
+
+def _model_io_hidden_key(key: str) -> bool:
+    lower = key.casefold().replace("-", "_")
+    return lower in {"data", "media", "image", "images"} or any(part in lower for part in _MODEL_IO_HIDDEN_KEY_PARTS)
+
+
+def _model_io_hidden_content_kind(kind: Any) -> bool:
+    if not isinstance(kind, str):
+        return False
+    normalized = kind.casefold().replace("-", "_")
+    return normalized in _MODEL_IO_HIDDEN_CONTENT_KINDS or normalized.startswith((
+        "reasoning_", "thinking_", "analysis_", "redacted_thinking_",
+    ))
+
+
+def _model_io_scalar(value: Any) -> list[str]:
+    if not isinstance(value, str):
+        return []
+    text = _clean_text(value)
+    return [text] if text and len(text) <= MAX_RECORD_BYTES else []
+
+
+def _model_io_message_text(value: Any, depth: int = 0) -> list[str]:
+    """Read message content fields only; ignore metadata and media payloads."""
+    if depth > 12:
+        return []
+    scalar = _model_io_scalar(value)
+    if scalar:
+        return scalar
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value[:128]:
+            parts.extend(_model_io_message_text(item, depth + 1))
+        return parts
+    if not isinstance(value, dict):
+        return []
+    kind = value.get("type")
+    if _model_io_hidden_content_kind(kind) or (isinstance(kind, str) and (
+        kind.casefold().startswith(("image", "audio", "video"))
+        or kind.casefold() in {"input_image", "output_image", "inline_data", "inlinedata", "binary"}
+    )):
+        return []
+    parts = []
+    for key in _MODEL_IO_MESSAGE_KEYS:
+        if key in value:
+            parts.extend(_model_io_message_text(value[key], depth + 1))
+    return parts
+
+
+def _model_io_tool_text(value: Any, depth: int = 0, key: str = "") -> list[str]:
+    """Read useful tool call/result values while excluding secret-bearing fields."""
+    if depth > 12 or _model_io_hidden_key(key):
+        return []
+    scalar = _model_io_scalar(value)
+    if scalar:
+        return scalar
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value[:128]:
+            parts.extend(_model_io_tool_text(item, depth + 1, key))
+        return parts
+    if not isinstance(value, dict):
+        return []
+    kind = value.get("type")
+    if _model_io_hidden_content_kind(kind) or (isinstance(kind, str) and (
+        kind.casefold().startswith(("image", "audio", "video"))
+        or kind.casefold() in {"input_image", "output_image", "inline_data", "inlinedata", "binary"}
+    )):
+        return []
+    parts: list[str] = []
+    for child_key, child_value in list(value.items())[:128]:
+        normalized = str(child_key).casefold().replace("-", "_")
+        if _model_io_hidden_key(str(child_key)):
+            continue
+        if normalized == "error":
+            if isinstance(child_value, dict):
+                parts.extend(_model_io_scalar(child_value.get("message")))
+            continue
+        if normalized in _MODEL_IO_TOOL_KEYS or (depth > 0 and normalized not in {"type", "role", "id"}):
+            parts.extend(_model_io_tool_text(child_value, depth + 1, str(child_key)))
+    return parts
+
+
+def _model_io_messages(value: Any) -> list[str]:
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value[:128]:
+            parts.extend(_model_io_message_text(item))
+        return parts
+    return _model_io_message_text(value)
+
+
+def _model_io_body(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str) or len(value.encode("utf-8", errors="ignore")) > MAX_RECORD_BYTES:
+        return None
+    try:
+        parsed = json.loads(value)
+    except (json.JSONDecodeError, ValueError, RecursionError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _model_io_error(value: Any) -> list[str]:
+    if not isinstance(value, dict):
+        return []
+    return _model_io_scalar(value.get("message"))
+
+
+def _model_io_record_text(record: dict[str, Any]) -> tuple[str, str] | None:
+    record_type = record.get("type")
+    if record_type not in {"model_io", "modelIOReset"}:
+        return None
+    parts: list[str] = []
+    seen: set[str] = set()
+
+    def add(values: list[str]) -> None:
+        for value in values:
+            if value not in seen:
+                seen.add(value)
+                parts.append(value)
+
+    request = record.get("request")
+    if isinstance(request, dict):
+        for key in ("messages", "sdkMessages"):
+            if key in request:
+                add(_model_io_messages(request[key]))
+        if "body" in request:
+            body = _model_io_body(request["body"])
+            if body is not None and "messages" in body:
+                add(_model_io_messages(body["messages"]))
+    if "sdkMessages" in record:
+        add(_model_io_messages(record["sdkMessages"]))
+
+    response = record.get("response")
+    if isinstance(response, dict):
+        add(_model_io_scalar(response.get("text")))
+        for key in ("toolCalls", "toolResults"):
+            if key in response:
+                add(_model_io_tool_text(response[key], key=key))
+        add(_model_io_error(response.get("error")))
+    for key in ("toolCalls", "toolResults"):
+        if key in record:
+            add(_model_io_tool_text(record[key], key=key))
+    if "error" in record:
+        add(_model_io_error(record["error"]))
+    if not parts:
+        return None
+    return (str(record_type), " ".join(parts))
+
+
 def _record_text(record: Any, format: str) -> tuple[str, str] | None:
     if not isinstance(record, dict):
         return None
+    if format == "model-io-jsonl":
+        return _model_io_record_text(record)
     if format == "claude-jsonl":
         record_type = str(record.get("type", "unknown"))
         message = record.get("message", record)
@@ -660,7 +934,7 @@ def iter_text_records(stream: BinaryIO, format: str, max_record_bytes: int = MAX
         yield _skip(1, "binary member is not decoded")
     elif format == "text":
         yield from _text_records(stream, max_record_bytes)
-    elif format in {"claude-jsonl", "grok-acp-jsonl", "generic-jsonl", "codex-jsonl"}:
+    elif format in {"claude-jsonl", "grok-acp-jsonl", "generic-jsonl", "codex-jsonl", "model-io-jsonl"}:
         yield from _jsonl_records(stream, format, max_record_bytes)
     elif format in {"gemini-json", "opencode-json", "common-json"}:
         yield from _full_json_records(stream, format)
@@ -719,6 +993,25 @@ def metadata_from_bytes(data: bytes, format: str) -> dict[str, str]:
     if not isinstance(data, bytes) or len(data) > MAX_JSON_BYTES:
         return {}
     result: dict[str, str] = {}
+    if format == "model-io-jsonl":
+        for line in data.splitlines()[:32]:
+            try:
+                value = json.loads(line.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError):
+                continue
+            if not isinstance(value, dict) or value.get("type") not in {"model_io", "modelIOReset"}:
+                continue
+            if "session_id" not in result:
+                for key in ("sessionId", "session_id"):
+                    if isinstance(value.get(key), str) and value[key]:
+                        result["session_id"] = value[key]
+                        break
+            if "started_at" not in result:
+                for key in ("startedAt", "started_at"):
+                    if isinstance(value.get(key), str) and value[key]:
+                        result["started_at"] = value[key]
+                        break
+        return result
     if format in {"claude-jsonl", "grok-acp-jsonl", "generic-jsonl", "codex-jsonl"}:
         for line in data.splitlines()[:32]:
             try:

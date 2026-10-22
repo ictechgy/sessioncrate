@@ -1,8 +1,9 @@
 """Safe, local storage primitives for Codex session archives.
 
 The module intentionally has no dependency on Codex's databases or indexes.
-It only knows about rollout JSONL files below ``sessions`` and
-``archived_sessions`` and stores compressed bytes plus small JSON manifests.
+It only knows about rollout JSONL files, including Zstandard-compressed copies,
+below ``sessions`` and ``archived_sessions``.  Archives retain the
+source bytes exactly and add only small JSON manifests.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterator
 
 from .activity import probe_session_file
+from . import zstd_io
 
 
 class VaultError(RuntimeError):
@@ -48,9 +50,13 @@ _PRIVATE_FILE = 0o600
 _DAY_NS = 86_400 * 1_000_000_000
 _HOUR_NS = 3_600 * 1_000_000_000
 _MAX_META_LINE = 16 * 1024 * 1024
+_MAX_ZSTD_RECORD_BYTES = _MAX_META_LINE
+_MIN_ZSTD_DECODED_BYTES = 64 * 1024 * 1024
+_MAX_ZSTD_DECODED_BYTES = 8 * 1024 * 1024 * 1024
+_MAX_ZSTD_EXPANSION_RATIO = 256
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _ARCHIVE_ID = re.compile(r"^[0-9a-f]{1,64}$")
-_ROLLOUT = re.compile(r"^rollout-.*\.jsonl$")
+_ROLLOUT = re.compile(r"^rollout-.*\.jsonl(?:\.zst)?$")
 _REQUIRED_MANIFEST = {
     "archive_id",
     "blob_sha256",
@@ -452,6 +458,17 @@ def _valid_relative_path(value: Any) -> str:
     return path.as_posix()
 
 
+def _is_zstd_relative(relative_path: str) -> bool:
+    return relative_path.endswith(".jsonl.zst")
+
+
+def _zstd_decoded_limit(raw_bytes: int) -> int:
+    return min(
+        _MAX_ZSTD_DECODED_BYTES,
+        max(_MIN_ZSTD_DECODED_BYTES, raw_bytes * _MAX_ZSTD_EXPANSION_RATIO),
+    )
+
+
 def _valid_manifest(
     manifest: Any,
     *,
@@ -485,6 +502,15 @@ def _valid_manifest(
             raise VaultError(f"manifest {key} is invalid")
     if manifest["source_mode"] > 0o1777:
         raise VaultError("manifest source_mode is invalid")
+    if _is_zstd_relative(relative):
+        decoded_bytes = manifest.get("decoded_bytes")
+        if (
+            isinstance(decoded_bytes, bool)
+            or not isinstance(decoded_bytes, int)
+            or decoded_bytes <= 0
+            or decoded_bytes > _zstd_decoded_limit(manifest["raw_bytes"])
+        ):
+            raise VaultError("manifest decoded_bytes is invalid for Zstandard content")
     if archive_id != _archive_id(source_root, relative, blob_sha):
         raise VaultError("manifest archive_id does not match source identity")
     normalized = dict(manifest)
@@ -627,30 +653,90 @@ def iter_archive_lines(
     if vault is None:
         raise VaultError("vault does not exist")
     checked = _valid_manifest(manifest)
+    if _is_zstd_relative(checked["relative_path"]) and not zstd_io.is_available():
+        raise VaultError("Zstandard content requires Python 3.14+")
     blob = _blob_path(vault, checked)
     _verify_gzip(blob, checked["blob_sha256"], checked["raw_bytes"])
-    try:
-        with gzip.open(blob, "rb") as stream:
+
+    if max_record_bytes is not None and (
+        isinstance(max_record_bytes, bool)
+        or not isinstance(max_record_bytes, int)
+        or max_record_bytes <= 0
+    ):
+        raise VaultError("max_record_bytes must be positive")
+
+    def lines_from(
+        stream: Any,
+        *,
+        expected_bytes: int | None = None,
+        decoded_limit: int | None = None,
+    ) -> Iterator[bytes | tuple[int, bytes | None]]:
+        total = 0
+        line_number = 0
+
+        def account(data: bytes) -> None:
+            nonlocal total
+            total += len(data)
+            if expected_bytes is not None and total > expected_bytes:
+                raise VaultError("Zstandard decoded size mismatch")
+            if decoded_limit is not None and total > decoded_limit:
+                raise VaultError("Zstandard content exceeds the safe decoded size limit")
+
+        zstd_raw_record_limit = (
+            _MAX_ZSTD_RECORD_BYTES
+            if expected_bytes is not None and max_record_bytes is None
+            else None
+        )
+        while True:
             if max_record_bytes is None:
-                for line in stream:
-                    yield line
+                if zstd_raw_record_limit is None:
+                    line = stream.readline()
+                else:
+                    line = stream.readline(zstd_raw_record_limit + 1)
             else:
-                if isinstance(max_record_bytes, bool) or not isinstance(max_record_bytes, int) or max_record_bytes <= 0:
-                    raise VaultError("max_record_bytes must be positive")
-                line_number = 0
-                while True:
-                    line = stream.readline(max_record_bytes + 1)
-                    if not line:
-                        break
-                    line_number += 1
-                    if len(line) <= max_record_bytes:
-                        yield line_number, line
-                        continue
-                    while not line.endswith(b"\n"):
-                        line = stream.readline(min(64 * 1024, max_record_bytes + 1))
-                        if not line:
-                            break
-                    yield line_number, None
+                line = stream.readline(max_record_bytes + 1)
+            if not line:
+                break
+            account(line)
+            line_number += 1
+            if max_record_bytes is None:
+                if zstd_raw_record_limit is not None and len(line) > zstd_raw_record_limit:
+                    raise VaultError(
+                        "Zstandard JSONL record exceeds the safe raw iterator line limit"
+                    )
+                yield line
+                continue
+            if len(line) <= max_record_bytes:
+                yield line_number, line
+                continue
+            while not line.endswith(b"\n"):
+                line = stream.readline(min(64 * 1024, max_record_bytes + 1))
+                if not line:
+                    break
+                account(line)
+            yield line_number, None
+
+        if expected_bytes is not None and total != expected_bytes:
+            raise VaultError("Zstandard decoded size mismatch")
+
+    try:
+        with gzip.open(blob, "rb") as original:
+            if not _is_zstd_relative(checked["relative_path"]):
+                yield from lines_from(original)
+                return
+            try:
+                with zstd_io.open_reader(original) as decoded:
+                    yield from lines_from(
+                        decoded,
+                        expected_bytes=checked["decoded_bytes"],
+                        decoded_limit=_zstd_decoded_limit(checked["raw_bytes"]),
+                    )
+            except zstd_io.ZstdUnavailableError as exc:
+                raise VaultError(str(exc)) from exc
+            except zstd_io.decode_errors() as exc:
+                raise VaultError(
+                    "Zstandard session is corrupt, truncated, or has trailing data"
+                ) from exc
     except (OSError, EOFError, gzip.BadGzipFile, zlib.error) as exc:
         raise VaultError(f"cannot read archive blob: {blob}: {exc}") from exc
 
@@ -688,13 +774,7 @@ def _hash_path(path: Path) -> tuple[str, int, os.stat_result]:
     return digest, size, expected
 
 
-def _session_meta(path: Path) -> tuple[dict[str, Any], bytes]:
-    fd = _open_nofollow(path, os.O_RDONLY)
-    try:
-        with os.fdopen(fd, "rb") as stream:
-            first = stream.readline(_MAX_META_LINE + 1)
-    except OSError as exc:
-        raise VaultError(f"cannot read session metadata: {path}: {exc}") from exc
+def _parse_session_meta(first: bytes, path: Path) -> dict[str, Any]:
     if not first or len(first) > _MAX_META_LINE:
         raise VaultError(f"session does not start with a bounded session_meta record: {path}")
     try:
@@ -706,6 +786,17 @@ def _session_meta(path: Path) -> tuple[dict[str, Any], bytes]:
     kind = record.get("type") or record.get("kind") or record.get("event")
     if kind != "session_meta":
         raise VaultError(f"first session record is not session_meta: {path}")
+    return record
+
+
+def _session_meta(path: Path) -> tuple[dict[str, Any], bytes]:
+    fd = _open_nofollow(path, os.O_RDONLY)
+    try:
+        with os.fdopen(fd, "rb") as stream:
+            first = stream.readline(_MAX_META_LINE + 1)
+    except OSError as exc:
+        raise VaultError(f"cannot read session metadata: {path}: {exc}") from exc
+    record = _parse_session_meta(first, path)
     return record, first
 
 
@@ -749,7 +840,64 @@ def _verify_gzip(path: Path, expected_sha: str, expected_size: int) -> None:
         raise VaultError(f"archive blob digest or size mismatch: {path}")
 
 
-def _stream_archive(path: Path, blobs: Path, expected: os.stat_result) -> tuple[Path, str, int, dict[str, str]]:
+def _metadata_from_stream(
+    stream: Any,
+    path: Path,
+    *,
+    decoded_limit: int | None = None,
+) -> tuple[dict[str, str], int]:
+    first_limit = _MAX_META_LINE + 1
+    if decoded_limit is not None:
+        first_limit = min(first_limit, decoded_limit + 1)
+    first = stream.readline(first_limit)
+    total = len(first)
+    if decoded_limit is not None and total > decoded_limit:
+        raise VaultError(f"Zstandard content exceeds the safe decoded size limit: {path}")
+    record = _parse_session_meta(first, path)
+
+    while True:
+        read_size = 1024 * 1024
+        if decoded_limit is not None:
+            read_size = min(read_size, decoded_limit - total + 1)
+        chunk = stream.read(read_size)
+        if not chunk:
+            break
+        total += len(chunk)
+        if decoded_limit is not None and total > decoded_limit:
+            raise VaultError(f"Zstandard content exceeds the safe decoded size limit: {path}")
+    return _metadata_fields(record), total
+
+
+def _metadata_from_archived_temp(
+    temp: Path,
+    source_path: Path,
+    raw_bytes: int,
+) -> tuple[dict[str, str], int]:
+    try:
+        with gzip.open(temp, "rb") as original:
+            try:
+                with zstd_io.open_reader(original) as decoded:
+                    metadata, decoded_bytes = _metadata_from_stream(
+                        decoded,
+                        source_path,
+                        decoded_limit=_zstd_decoded_limit(raw_bytes),
+                    )
+                return metadata, decoded_bytes
+            except zstd_io.ZstdUnavailableError as exc:
+                raise VaultError(str(exc)) from exc
+            except zstd_io.decode_errors() as exc:
+                raise VaultError(
+                    f"Zstandard session is corrupt, truncated, or has trailing data: {source_path}"
+                ) from exc
+    except (OSError, EOFError, gzip.BadGzipFile, zlib.error) as exc:
+        raise VaultError(f"cannot read archived source copy: {source_path}") from exc
+
+
+def _stream_archive(
+    path: Path,
+    blobs: Path,
+    expected: os.stat_result,
+) -> tuple[Path, str, int, dict[str, str], int | None]:
     fd = _open_nofollow(path, os.O_RDONLY)
     fd_open = True
     temp: Path | None = None
@@ -760,29 +908,27 @@ def _stream_archive(path: Path, blobs: Path, expected: os.stat_result) -> tuple[
         temp_fd, temp_name = tempfile.mkstemp(prefix=".vault-blob-", dir=blobs)
         temp = Path(temp_name)
         os.fchmod(temp_fd, _PRIVATE_FILE)
-        first: bytes | None = None
+        is_zstd = _is_zstd_relative(path.name)
         metadata: dict[str, str] = {}
         source_stream = os.fdopen(fd, "rb")
         fd_open = False
         with source_stream as source, os.fdopen(temp_fd, "wb") as raw:
             digest = hashlib.sha256()
             total = 0
-            with gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as compressed:
-                first = source.readline(_MAX_META_LINE + 1)
-                if not first or len(first) > _MAX_META_LINE:
-                    raise VaultError(f"session does not start with a bounded session_meta record: {path}")
-                try:
-                    record = json.loads(first.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                    raise VaultError(f"first session record is invalid JSON: {path}") from exc
-                if not isinstance(record, dict) or (
-                    record.get("type") or record.get("kind") or record.get("event")
-                ) != "session_meta":
-                    raise VaultError(f"first session record is not session_meta: {path}")
-                metadata = _metadata_fields(record)
-                compressed.write(first)
-                digest.update(first)
-                total += len(first)
+            compression_level = 0 if is_zstd else 9
+            with gzip.GzipFile(
+                fileobj=raw,
+                mode="wb",
+                compresslevel=compression_level,
+                mtime=0,
+            ) as compressed:
+                if not is_zstd:
+                    first = source.readline(_MAX_META_LINE + 1)
+                    record = _parse_session_meta(first, path)
+                    metadata = _metadata_fields(record)
+                    compressed.write(first)
+                    digest.update(first)
+                    total += len(first)
                 while True:
                     chunk = source.read(1024 * 1024)
                     if not chunk:
@@ -810,7 +956,10 @@ def _stream_archive(path: Path, blobs: Path, expected: os.stat_result) -> tuple[
         ):
             raise VaultError(f"source metadata changed while archiving: {path}")
         _verify_gzip(temp, digest.hexdigest(), total)
-        return temp, digest.hexdigest(), total, metadata
+        decoded_bytes: int | None = None
+        if is_zstd:
+            metadata, decoded_bytes = _metadata_from_archived_temp(temp, path, total)
+        return temp, digest.hexdigest(), total, metadata, decoded_bytes
     except Exception:
         if fd_open:
             try:
@@ -845,9 +994,10 @@ def _new_manifest(
     compressed_bytes: int,
     source_stat: os.stat_result,
     metadata: dict[str, str],
+    decoded_bytes: int | None = None,
 ) -> dict[str, Any]:
     root_string = str(source_root)
-    return {
+    manifest = {
         "archive_id": _archive_id(root_string, relative_path, blob_sha),
         "blob_sha256": blob_sha,
         "blob": f"blobs/{blob_sha}.jsonl.gz",
@@ -863,6 +1013,9 @@ def _new_manifest(
         "source_mode": int(stat.S_IMODE(source_stat.st_mode)),
         "archived_at": datetime.now(timezone.utc).isoformat(),
     }
+    if decoded_bytes is not None:
+        manifest["decoded_bytes"] = int(decoded_bytes)
+    return manifest
 
 
 def _existing_manifest(vault: Path, archive_id: str) -> dict[str, Any] | None:
@@ -912,6 +1065,8 @@ def _archive_candidate(
     temp: Path | None = None
     try:
         source = _source_candidate_path(root, item)
+        if _is_zstd_relative(item["relative_path"]) and not zstd_io.is_available():
+            raise VaultError("Zstandard content requires Python 3.14+")
         source_stat = _safe_regular(source, label="source")
         if source_stat.st_size != item["size"] or source_stat.st_mtime_ns != item["mtime_ns"]:
             raise VaultError(f"source changed after scan: {source}")
@@ -920,7 +1075,7 @@ def _archive_candidate(
             raise VaultError(f"source mode is unsupported: {oct(source_mode)}")
         if remove_originals and time.time_ns() - source_stat.st_mtime_ns < _HOUR_NS:
             raise VaultError(f"source must be at least one hour old before removal: {source}")
-        temp, sha, raw_bytes, metadata = _stream_archive(source, blobs, source_stat)
+        temp, sha, raw_bytes, metadata, decoded_bytes = _stream_archive(source, blobs, source_stat)
         manifest = _new_manifest(
             source_root=root,
             relative_path=item["relative_path"],
@@ -929,11 +1084,16 @@ def _archive_candidate(
             compressed_bytes=0,
             source_stat=source_stat,
             metadata=metadata,
+            decoded_bytes=decoded_bytes,
         )
         manifest = _valid_manifest(manifest)
         existing_manifest = _existing_manifest(vault, manifest["archive_id"])
         if existing_manifest is not None:
-            if existing_manifest["blob_sha256"] != sha or existing_manifest["raw_bytes"] != raw_bytes:
+            if (
+                existing_manifest["blob_sha256"] != sha
+                or existing_manifest["raw_bytes"] != raw_bytes
+                or existing_manifest.get("decoded_bytes") != decoded_bytes
+            ):
                 raise VaultError("archive id already exists with different content")
             _verify_gzip(_blob_path(vault, existing_manifest), sha, raw_bytes)
             manifest["compressed_bytes"] = existing_manifest["compressed_bytes"]
@@ -963,6 +1123,7 @@ def _archive_candidate(
             or published_manifest["raw_bytes"] != manifest["raw_bytes"]
             or published_manifest["source_root"] != manifest["source_root"]
             or published_manifest["relative_path"] != manifest["relative_path"]
+            or published_manifest.get("decoded_bytes") != manifest.get("decoded_bytes")
         ):
             raise VaultError("manifest publication race produced different metadata")
         _fsync_directory(manifest_path.parent)

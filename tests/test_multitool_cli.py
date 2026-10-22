@@ -58,6 +58,54 @@ class MultiToolCLITests(unittest.TestCase):
         self.assertEqual(by_id['agy']['mode'], 'export')
         self.assertIsNone(by_id['agy']['default_root'])
 
+    def test_diagnostic_tools_require_explicit_root(self):
+        catalog = {item['id']: item for item in json.loads(self.run_cli('tools').stdout)['tools']}
+        for tool in ('zcode', 'autoclaw'):
+            with self.subTest(tool=tool):
+                self.assertEqual(catalog[tool]['mode'], 'diagnostic')
+                self.assertIsNone(catalog[tool]['default_root'])
+                result = self.run_cli('scan', '--tool', tool, success=False)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn('--source-root', json.loads(result.stdout)['error'])
+
+    @unittest.skipUnless(shutil.which('lsof'), 'lsof is unavailable')
+    def test_diagnostic_log_roundtrip_preserves_unselected_database_and_active_log(self):
+        for tool in ('zcode', 'autoclaw'):
+            with self.subTest(tool=tool):
+                root = self.base / (tool + ' diagnostic logs')
+                root.mkdir()
+                source = root / 'model-io-sess-fixture.jsonl'
+                raw = (json.dumps({'type': 'model_io', 'sessionId': 'synthetic/main',
+                                  'request': {'messages': [{'role': 'user', 'content': '진단 질문'}],
+                                              'headers': {'authorization': 'synthetic-hidden-header'}},
+                                  'response': {'text': '진단 응답'}}, ensure_ascii=False) + '\n').encode()
+                source.write_bytes(raw)
+                unrelated = root / 'session.db'
+                unrelated.write_bytes(b'synthetic shared database sentinel')
+                age_tree(root)
+                original_stat = source.stat()
+                archived = json.loads(self.run_cli('archive', '--tool', tool, '--source-root', str(root), '--execute').stdout)['archived']
+                self.assertEqual(len(archived), 1)
+                manifest = archived[0]
+                self.assertEqual(manifest['source_mode'], 'diagnostic')
+                self.assertEqual([item['path'] for item in manifest['files']], [source.name])
+                self.assertEqual(manifest['directories'], [])
+                with source.open('rb'):
+                    busy = json.loads(self.run_cli('prune', manifest['archive_id'], '--execute').stdout)
+                self.assertFalse(busy['removed'])
+                self.assertTrue(source.exists())
+                idle = json.loads(self.run_cli('prune', manifest['archive_id'], '--execute').stdout)
+                self.assertEqual(idle['removed'], [manifest['archive_id']])
+                self.assertFalse(source.exists())
+                for query in ('진단 질문', '진단 응답'):
+                    self.assertTrue(json.loads(self.run_cli('search', query, '--tool', tool).stdout)['matches'])
+                self.assertFalse(json.loads(self.run_cli('search', 'synthetic-hidden-header', '--tool', tool).stdout)['matches'])
+                self.run_cli('verify', manifest['archive_id'])
+                self.run_cli('restore', manifest['archive_id'], '--execute')
+                self.assertEqual(source.read_bytes(), raw)
+                self.assertEqual(source.stat().st_mtime_ns, original_stat.st_mtime_ns)
+                self.assertEqual(unrelated.read_bytes(), b'synthetic shared database sentinel')
+
     def test_claude_bundle_search_and_restore_includes_companions(self):
         home, originals = self.claude_fixture()
         self.run_cli('--tool', 'claude', '--source-root', str(home), 'archive', '--execute')

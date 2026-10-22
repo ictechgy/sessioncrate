@@ -194,6 +194,15 @@ class SearchTests(unittest.TestCase):
                     search(vault, "secret")
                 self.assertNotIn("secret", str(error.exception))
 
+    def test_zstandard_errors_are_not_mislabeled_as_gzip_corruption(self):
+        with tempfile.TemporaryDirectory() as temp:
+            vault, manifest = _archive_fixture(Path(temp), [])
+            with patch("codex_vault.search.list_archives", return_value=[manifest]), \
+                 patch.object(search_module, "_storage_iter_archive_lines", side_effect=VaultError("Zstandard content is corrupt or truncated")):
+                with self.assertRaisesRegex(VaultError, "Zstandard") as error:
+                    search(vault, "needle")
+                self.assertNotIn("gzip", str(error.exception))
+
     def test_very_long_record_is_skipped_with_count(self):
         with tempfile.TemporaryDirectory() as temp:
             vault, manifest = _archive_fixture(

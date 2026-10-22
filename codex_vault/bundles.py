@@ -59,6 +59,7 @@ _FORMATS = {
     "gemini-json",
     "opencode-json",
     "common-json",
+    "model-io-jsonl",
 }
 _REQUIRED_MANIFEST = {
     "schema_version",
@@ -200,6 +201,17 @@ def _validate_root_scope(
         if tool not in _EXPORT_TOOLS or len(roots) != 1 or roots[0] not in file_paths:
             raise VaultError("export bundle root must be one explicit export file")
         return
+    if source_mode == "diagnostic":
+        if (
+            tool not in {"zcode", "autoclaw"}
+            or len(roots) != 1
+            or file_paths != set(roots)
+            or directory_paths
+            or len(PurePosixPath(roots[0]).parts) != 1
+            or session_id != PurePosixPath(roots[0]).stem
+        ):
+            raise VaultError("diagnostic bundle must contain one flat model-io log file")
+        return
     if not session_id or "/" in session_id or "\\" in session_id:
         raise VaultError("native bundle session id is invalid")
     parts = [PurePosixPath(root).parts for root in roots]
@@ -263,7 +275,7 @@ def _validate_manifest(manifest: Any, *, expected_id: str | None = None) -> dict
         raise VaultError("bundle manifest filename does not match archive id")
     tool = manifest.get("tool")
     source_mode = manifest.get("source_mode")
-    if not isinstance(tool, str) or not tool or not isinstance(source_mode, str) or source_mode not in {"native", "export"}:
+    if not isinstance(tool, str) or not tool or not isinstance(source_mode, str) or source_mode not in {"native", "export", "diagnostic"}:
         raise VaultError("bundle tool or source_mode is invalid")
     source_root = manifest.get("source_root")
     if (
@@ -338,6 +350,8 @@ def _validate_manifest(manifest: Any, *, expected_id: str | None = None) -> dict
         raise VaultError("bundle files are not in canonical order")
     file_paths = {item["path"] for item in normalized_files}
     directory_paths = {item["path"] for item in normalized_directories}
+    if source_mode == "diagnostic" and any(item["format"] != "model-io-jsonl" for item in normalized_files):
+        raise VaultError("diagnostic bundle must use the model-io text reader")
     _validate_topology(roots, file_paths, directory_paths)
     _validate_root_scope(tool, source_mode, session_id, roots, file_paths, directory_paths)
     blob_sha = manifest.get("blob_sha256")

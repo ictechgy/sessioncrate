@@ -73,6 +73,20 @@ class MultiToolCLITests(unittest.TestCase):
         for relative, original in originals.items():
             self.assertEqual((destination / relative).read_bytes(), original)
 
+    def test_all_tool_search_keeps_bundle_hits_when_codex_is_damaged(self):
+        home, _ = self.claude_fixture()
+        self.run_cli('archive', '--tool', 'claude', '--source-root', str(home), '--execute')
+        manifests = self.vault / 'manifests'
+        manifests.mkdir()
+        (manifests / ('0' * 64 + '.json')).write_text('{}')
+        result = self.run_cli('search', '하위 에이전트', success=False)
+        self.assertEqual(result.returncode, 2)
+        payload = json.loads(result.stdout)
+        self.assertEqual(len(payload['matches']), 1)
+        self.assertEqual(payload['matches'][0]['tool'], 'claude')
+        self.assertTrue(payload['partial'])
+        self.assertEqual(payload['errors'][0]['namespace'], 'codex')
+
     def test_bundle_recovery_ignores_unrelated_damaged_bundle_manifest(self):
         home, originals = self.claude_fixture()
         self.run_cli('--tool', 'claude', '--source-root', str(home), 'archive', '--execute')

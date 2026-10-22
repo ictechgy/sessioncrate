@@ -26,6 +26,15 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(len(entries), 1)
         return entries[0]
 
+    def _replace_blob_with_invalid_deflate(self, vault: Path, manifest: dict) -> Path:
+        blob = vault / manifest["blob"]
+        original_size = blob.stat().st_size
+        gzip_header = bytes.fromhex("1f8b08000000000000ff")
+        corrupt = gzip_header + b"\x07"
+        self.assertLessEqual(len(corrupt), original_size)
+        blob.write_bytes(corrupt.ljust(original_size, b"\x00"))
+        return blob
+
     def test_scan_is_metadata_only_and_reports_age(self) -> None:
         home = make_codex_home(self.tmp_path)
         old = make_session(home)
@@ -144,6 +153,116 @@ class StorageTests(unittest.TestCase):
         with self.assertRaises(storage.VaultError):
             storage.restore(vault, manifest["archive_id"], execute=True)
         self.assertEqual(source.read_bytes(), original)
+
+    def test_invalid_deflate_is_reported_as_failed_verification(self) -> None:
+        home = make_codex_home(self.tmp_path)
+        source = make_session(home)
+        original = source.read_bytes()
+        vault = self.tmp_path / "vault"
+        storage.archive(home, vault, older_than_days=1, execute=True)
+        manifest = self._manifest(vault)
+        self._replace_blob_with_invalid_deflate(vault, manifest)
+
+        result = storage.verify(vault, manifest["archive_id"])
+
+        self.assertFalse(result["ok"])
+        self.assertIn("corrupt or truncated", result["error"])
+        self.assertEqual(source.read_bytes(), original)
+
+    def test_reader_normalizes_invalid_deflate_error(self) -> None:
+        home = make_codex_home(self.tmp_path)
+        source = make_session(home)
+        original = source.read_bytes()
+        vault = self.tmp_path / "vault"
+        storage.archive(home, vault, older_than_days=1, execute=True)
+        manifest = self._manifest(vault)
+        self._replace_blob_with_invalid_deflate(vault, manifest)
+
+        with mock.patch.object(storage, "_verify_gzip", return_value=None):
+            with self.assertRaisesRegex(storage.VaultError, "cannot read archive blob"):
+                list(storage.iter_archive_lines(vault, manifest))
+
+        self.assertEqual(source.read_bytes(), original)
+
+    def test_restore_normalizes_invalid_deflate_without_publishing_destination(self) -> None:
+        home = make_codex_home(self.tmp_path)
+        source = make_session(home)
+        original = source.read_bytes()
+        vault = self.tmp_path / "vault"
+        storage.archive(home, vault, older_than_days=1, execute=True)
+        manifest = self._manifest(vault)
+        self._replace_blob_with_invalid_deflate(vault, manifest)
+        destination = self.tmp_path / "restore home"
+        target = destination / manifest["relative_path"]
+        target.parent.mkdir(parents=True)
+        sentinel = target.parent / "sentinel"
+        sentinel.write_bytes(b"keep")
+        before = {path.name: path.read_bytes() for path in target.parent.iterdir()}
+
+        with mock.patch.object(storage, "_verify_one", return_value={"ok": True}):
+            with self.assertRaisesRegex(storage.VaultError, "corrupt during restore"):
+                storage.restore(vault, manifest["archive_id"], destination, execute=True)
+
+        self.assertEqual(source.read_bytes(), original)
+        self.assertFalse(target.exists())
+        self.assertEqual(
+            {path.name: path.read_bytes() for path in target.parent.iterdir()},
+            before,
+        )
+
+    def test_archive_rejects_setuid_mode_before_publishing(self) -> None:
+        home = make_codex_home(self.tmp_path)
+        source = make_session(home, mode=0o755)
+        os.chmod(source, 0o4755)
+        vault = self.tmp_path / "vault"
+
+        result = storage.archive(home, vault, older_than_days=1, execute=True)
+
+        self.assertEqual(result["archived"], [])
+        self.assertEqual(len(result["errors"]), 1)
+        self.assertIn("source mode is unsupported", result["errors"][0]["reason"])
+        self.assertTrue(source.exists())
+        self.assertEqual(list((vault / "blobs").iterdir()), [])
+        self.assertEqual(list((vault / "manifests").iterdir()), [])
+
+    def test_rearchive_rejects_setgid_mode_and_preserves_valid_manifest(self) -> None:
+        home = make_codex_home(self.tmp_path)
+        source = make_session(home, mode=0o755)
+        vault = self.tmp_path / "vault"
+        storage.archive(home, vault, older_than_days=1, execute=True)
+        manifest = self._manifest(vault)
+        manifest_path = vault / "manifests" / f"{manifest['archive_id']}.json"
+        original_manifest = manifest_path.read_bytes()
+        os.chmod(source, 0o2755)
+
+        result = storage.archive(home, vault, older_than_days=1, execute=True)
+
+        self.assertEqual(result["archived"], [])
+        self.assertEqual(len(result["errors"]), 1)
+        self.assertIn("source mode is unsupported", result["errors"][0]["reason"])
+        self.assertEqual(manifest_path.read_bytes(), original_manifest)
+        self.assertTrue(storage.verify(vault, manifest["archive_id"])["ok"])
+
+    def test_unsupported_timestamp_never_publishes_or_replaces_manifest(self) -> None:
+        for existing in (False, True):
+            with self.subTest(existing=existing):
+                base = self.tmp_path / str(existing)
+                home = make_codex_home(base)
+                source = make_session(home)
+                vault = base / "vault"
+                if existing:
+                    storage.archive(home, vault, older_than_days=1, execute=True)
+                before = {path.relative_to(vault): path.read_bytes()
+                          for path in vault.rglob('*') if path.is_file() and path.name != '.lock'}
+                os.utime(source, ns=(-1, -1))
+                result = storage.archive(home, vault, older_than_days=1, execute=True)
+                self.assertEqual(result["archived"], [])
+                self.assertTrue(result["errors"])
+                after = {path.relative_to(vault): path.read_bytes()
+                         for path in vault.rglob('*') if path.is_file() and path.name != '.lock'}
+                self.assertEqual(after, before)
+                self.assertTrue(source.exists())
+                self.assertEqual(len(storage.list_archives(vault)), int(existing))
 
     def test_source_mutation_refuses_archive_and_keeps_original(self) -> None:
         home = make_codex_home(self.tmp_path)
@@ -526,6 +645,32 @@ class StorageTests(unittest.TestCase):
         with self.assertRaises(storage.VaultError):
             storage.list_archives(vault)
 
+    def test_prefix_resolution_ignores_unrelated_malformed_manifest(self) -> None:
+        home = make_codex_home(self.tmp_path)
+        make_session(home)
+        vault = self.tmp_path / "vault"
+        storage.archive(home, vault, older_than_days=1, execute=True)
+        manifest = self._manifest(vault)
+        other_digit = "0" if manifest["archive_id"][0] != "0" else "1"
+        unrelated = vault / "manifests" / f"{other_digit * 64}.json"
+        unrelated.write_text("{}", encoding="utf-8")
+
+        resolved = storage.resolve_archive(vault, manifest["archive_id"][:12])
+
+        self.assertEqual(resolved["archive_id"], manifest["archive_id"])
+
+    def test_prefix_resolution_rejects_matching_malformed_manifest(self) -> None:
+        home = make_codex_home(self.tmp_path)
+        make_session(home)
+        vault = self.tmp_path / "vault"
+        storage.archive(home, vault, older_than_days=1, execute=True)
+        manifest = self._manifest(vault)
+        manifest_path = vault / "manifests" / f"{manifest['archive_id']}.json"
+        manifest_path.write_text("{}", encoding="utf-8")
+
+        with self.assertRaisesRegex(storage.VaultError, "missing required fields"):
+            storage.resolve_archive(vault, manifest["archive_id"][:12])
+
     def test_iterator_rejects_untrusted_manifest_identity(self) -> None:
         home = make_codex_home(self.tmp_path)
         make_session(home)
@@ -537,6 +682,124 @@ class StorageTests(unittest.TestCase):
 
         with self.assertRaises(storage.VaultError):
             list(storage.iter_archive_lines(vault, tampered))
+
+    def test_prune_preview_skips_unreadable_source_and_continues(self) -> None:
+        home = make_codex_home(self.tmp_path)
+        blocked = make_session(home, "sessions/a/rollout-blocked.jsonl")
+        readable = make_session(home, "sessions/z/rollout-readable.jsonl")
+        vault = self.tmp_path / "vault"
+        storage.archive(home, vault, older_than_days=1, execute=True)
+        real_hash_path = storage._hash_path
+
+        def hash_path(path: Path):
+            if path == blocked:
+                raise PermissionError("source is unreadable")
+            return real_hash_path(path)
+
+        inactive = {"state": "inactive", "reason": "no open file handles"}
+        with mock.patch.object(storage, "_hash_path", side_effect=hash_path):
+            with mock.patch.object(storage, "probe_session_file", return_value=inactive):
+                result = storage.prune(vault, execute=False)
+
+        by_path = {item["relative_path"]: item for item in result["candidates"]}
+        self.assertFalse(by_path[str(blocked.relative_to(home))]["eligible"])
+        self.assertIn("unreadable", by_path[str(blocked.relative_to(home))]["reason"])
+        self.assertTrue(by_path[str(readable.relative_to(home))]["eligible"])
+
+    def test_prune_preview_skips_source_path_oserror_and_continues(self) -> None:
+        home = make_codex_home(self.tmp_path)
+        blocked = make_session(home, "sessions/a/rollout-blocked.jsonl")
+        readable = make_session(home, "sessions/z/rollout-readable.jsonl")
+        vault = self.tmp_path / "vault"
+        storage.archive(home, vault, older_than_days=1, execute=True)
+        real_source_path = storage._source_path_for_manifest
+
+        def source_path(manifest: dict) -> Path:
+            if manifest["relative_path"] == str(blocked.relative_to(home)):
+                raise PermissionError("source path is inaccessible")
+            return real_source_path(manifest)
+
+        inactive = {"state": "inactive", "reason": "no open file handles"}
+        with mock.patch.object(storage, "_source_path_for_manifest", side_effect=source_path):
+            with mock.patch.object(storage, "probe_session_file", return_value=inactive):
+                result = storage.prune(vault, execute=False)
+
+        by_path = {item["relative_path"]: item for item in result["candidates"]}
+        self.assertFalse(by_path[str(blocked.relative_to(home))]["eligible"])
+        self.assertIn("inaccessible", by_path[str(blocked.relative_to(home))]["reason"])
+        self.assertTrue(by_path[str(readable.relative_to(home))]["eligible"])
+
+    def test_archive_removal_skips_source_path_oserror_before_quarantine(self) -> None:
+        home = make_codex_home(self.tmp_path)
+        source = make_session(home)
+        original = source.read_bytes()
+        vault = self.tmp_path / "vault"
+
+        with mock.patch.object(
+            storage,
+            "_source_path_for_manifest",
+            side_effect=PermissionError("source path is inaccessible"),
+        ):
+            result = storage.archive(
+                home,
+                vault,
+                older_than_days=1,
+                execute=True,
+                remove_originals=True,
+            )
+
+        self.assertEqual(len(result["archived"]), 1)
+        self.assertEqual(result["removed"], [])
+        self.assertEqual(len(result["skipped"]), 1)
+        self.assertIn("inaccessible", result["skipped"][0]["reason"])
+        self.assertEqual(source.read_bytes(), original)
+        self.assertTrue(storage.verify(vault)["ok"])
+
+    def test_pre_unlink_directory_fsync_failure_restores_source(self) -> None:
+        home = make_codex_home(self.tmp_path)
+        source = make_session(home)
+        original = source.read_bytes()
+        vault = self.tmp_path / "vault"
+        storage.archive(home, vault, older_than_days=1, execute=True)
+        manifest = self._manifest(vault)
+        inactive = {"state": "inactive", "reason": "no open file handles"}
+
+        with mock.patch.object(storage, "probe_session_file", return_value=inactive):
+            with mock.patch.object(
+                storage,
+                "_fsync_directory",
+                side_effect=[OSError("pre-unlink fsync failed"), None],
+            ):
+                with self.assertRaisesRegex(storage.VaultError, "source restored"):
+                    storage.prune(vault, manifest["archive_id"], execute=True)
+
+        self.assertEqual(source.read_bytes(), original)
+        self.assertEqual(list(source.parent.glob(".codex-vault-pending-*")), [])
+        self.assertTrue(storage.verify(vault, manifest["archive_id"])["ok"])
+
+    def test_post_unlink_directory_fsync_failure_reports_source_removed(self) -> None:
+        home = make_codex_home(self.tmp_path)
+        source = make_session(home)
+        vault = self.tmp_path / "vault"
+        storage.archive(home, vault, older_than_days=1, execute=True)
+        manifest = self._manifest(vault)
+        inactive = {"state": "inactive", "reason": "no open file handles"}
+
+        with mock.patch.object(storage, "probe_session_file", return_value=inactive):
+            with mock.patch.object(
+                storage,
+                "_fsync_directory",
+                side_effect=[None, OSError("post-unlink fsync failed")],
+            ):
+                with self.assertRaisesRegex(
+                    storage.VaultError,
+                    "source was removed but removal durability could not be confirmed",
+                ):
+                    storage.prune(vault, manifest["archive_id"], execute=True)
+
+        self.assertFalse(source.exists())
+        self.assertEqual(list(source.parent.glob(".codex-vault-pending-*")), [])
+        self.assertTrue(storage.verify(vault, manifest["archive_id"])["ok"])
 
     def test_process_guard_mutating_quarantine_preserves_pending_file(self) -> None:
         home = make_codex_home(self.tmp_path)

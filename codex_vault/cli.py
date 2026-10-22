@@ -116,6 +116,10 @@ def _print_human(result):
             print('Result limit reached; narrow the query or increase --limit.')
         if result.get('skipped_records'):
             print(f"Skipped {result['skipped_records']} oversized or unsupported record(s).")
+        if result.get('errors'):
+            print('Partial results: some archive namespaces could not be searched.')
+            for error in result['errors']:
+                print(f"  {_clean(error['namespace'])}: {_clean(error['error'])}")
         return
     if 'archives' in result and isinstance(result['archives'], list):
         rows = result['archives']
@@ -286,7 +290,11 @@ def _run(args, vault):
         backend, item = _resolve_backend(vault, args.archive_id, selected)
         archive_id = item['archive_id']
         if command == 'restore':
-            return backend.restore(vault, archive_id, destination_home=args.destination_home, execute=args.execute)
+            try:
+                destination = args.destination_home.expanduser().absolute() if args.destination_home is not None else None
+            except RuntimeError as error:
+                raise storage.VaultError('destination home could not be expanded') from error
+            return backend.restore(vault, archive_id, destination_home=destination, execute=args.execute)
         if command == 'show':
             reader = legacy_search if backend is storage else backend
             return reader.show(vault, archive_id, limit=args.limit, query=args.query)
@@ -323,19 +331,30 @@ def _run(args, vault):
             return storage.prune(vault, execute=args.execute)
         return bundles.prune(vault, execute=args.execute, tool=tool)
     if command == 'search':
+        if not args.query.strip():
+            raise storage.VaultError('query must not be blank')
         results = []
+        errors = []
+        namespaces = []
         if selected in (None, 'codex'):
-            result = legacy_search.search(vault, args.query, limit=args.limit,
-                                          project=args.project, session_id=args.session_id)
-            result['matches'] = [{**item, 'tool': 'codex'} for item in result['matches']]
-            results.append(result)
+            namespaces.append(('codex', legacy_search, {}))
         if selected != 'codex':
-            results.append(bundles.search(vault, args.query, limit=args.limit, project=args.project,
-                                          session_id=args.session_id, tool=selected))
+            namespaces.append(('bundles', bundles, {'tool': selected}))
+        for name, backend, options in namespaces:
+            try:
+                result = backend.search(vault, args.query, limit=args.limit, project=args.project,
+                                        session_id=args.session_id, **options)
+            except (storage.VaultError, OSError) as error:
+                errors.append({'namespace': name, 'error': str(error)})
+                continue
+            if name == 'codex':
+                result['matches'] = [{**item, 'tool': 'codex'} for item in result['matches']]
+            results.append(result)
         matches = [item for result in results for item in result['matches']]
         return {'query': args.query, 'matches': matches[:args.limit],
                 'scanned_archives': sum(result.get('scanned_archives', 0) for result in results),
                 'skipped_records': sum(result.get('skipped_records', 0) for result in results),
+                'partial': bool(errors), 'errors': errors,
                 'truncated': len(matches) > args.limit or any(result.get('truncated', False) for result in results)}
     raise storage.VaultError('unsupported command')
 

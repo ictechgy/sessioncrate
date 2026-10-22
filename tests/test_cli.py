@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -199,10 +200,65 @@ class CLITests(unittest.TestCase):
         (manifests / f'{"0" * 64}.json').write_text('{}')
         self.assertTrue(json.loads(self.run_cli('search', '한글', '--tool', 'codex').stdout)['matches'])
 
+    def test_all_tool_search_keeps_healthy_hits_and_reports_namespace_failure(self):
+        self.run_cli('archive', '--execute')
+        (self.vault / 'bundles').write_text('broken namespace')
+        result = self.run_cli('search', '한글', success=False)
+        self.assertEqual(result.returncode, 2)
+        payload = json.loads(result.stdout)
+        self.assertEqual(len(payload['matches']), 1)
+        self.assertEqual(payload['matches'][0]['tool'], 'codex')
+        self.assertTrue(payload['partial'])
+        self.assertEqual(payload['errors'][0]['namespace'], 'bundles')
+        human = subprocess.run(
+            [sys.executable, str(ROOT / 'bin/sessioncrate'), '--vault', str(self.vault),
+             'search', '한글'], cwd=self.base, capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(human.returncode, 2)
+        self.assertIn('한글', human.stdout)
+        self.assertIn('Partial results', human.stdout)
+        self.assertIn('bundles', human.stdout)
+
     def test_verify_missing_vault_is_an_error(self):
         result = self.run_cli('verify', success=False)
         self.assertEqual(result.returncode, 2)
         self.assertIn('does not exist', json.loads(result.stdout)['error'])
+
+    def test_restore_expands_user_destination_for_both_backends(self):
+        from codex_vault import bundles, cli, storage
+        for backend in (storage, bundles):
+            for execute in (False, True):
+                with self.subTest(backend=backend.__name__, execute=execute):
+                    args = cli.parser().parse_args([
+                        'restore', 'a' * 64, '--destination-home', '~/sessioncrate-synthetic-restore',
+                        *(['--execute'] if execute else []),
+                    ])
+                    # Stub only the write boundary. No real home directory is read or changed.
+                    with mock.patch.object(cli, '_resolve_backend', return_value=(backend, {'archive_id': 'a' * 64})), \
+                         mock.patch.object(backend, 'restore', return_value={'ok': True}) as restore:
+                        cli._run(args, self.vault)
+                    self.assertEqual(restore.call_args.kwargs['destination_home'],
+                                     Path('~/sessioncrate-synthetic-restore').expanduser().absolute())
+                    self.assertEqual(restore.call_args.kwargs['execute'], execute)
+
+    def test_restore_unexpandable_home_is_a_safe_error(self):
+        from codex_vault import cli, storage
+        output = io.StringIO()
+        real_expand = Path.expanduser
+
+        def expand(path):
+            if str(path).startswith('~missing-synthetic-user/'):
+                raise RuntimeError('Could not determine home directory')
+            return real_expand(path)
+
+        with mock.patch.object(cli, '_resolve_backend', return_value=(storage, {'archive_id': 'a' * 64})), \
+             mock.patch.object(Path, 'expanduser', expand), \
+             mock.patch.object(storage, 'restore') as restore, contextlib.redirect_stdout(output):
+            status = cli.main(['--vault', str(self.vault), '--json', 'restore', 'a' * 64,
+                               '--destination-home', '~missing-synthetic-user/restore'])
+        self.assertEqual(status, 2)
+        self.assertIn('expand', json.loads(output.getvalue())['error'])
+        restore.assert_not_called()
 
     def test_human_bundle_scan_displays_path_and_source_bytes(self):
         from codex_vault.cli import _print_human

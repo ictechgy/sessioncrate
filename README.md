@@ -95,7 +95,7 @@ sessioncrate search "migration" --session ARCHIVE_ID
 sessioncrate show ARCHIVE_ID --limit 30
 ```
 
-Search performs literal, Unicode case-insensitive substring matching. It streams compressed archive members and does not create a second plaintext transcript store. Results include the archive ID, project, source member or record location, and bounded context. Use project, session, and limit filters for large vaults.
+Search performs literal, Unicode case-insensitive substring matching. It streams compressed archive members and does not create a second plaintext transcript store. Results include the archive ID, project, source member or record location, and bounded context. Use project and session filters to narrow the archives searched. `--limit` bounds the number of returned results, not the verification work: each archive read is checked through its end, even after enough matches are found.
 
 Unknown, binary, image, encrypted, or oversized records may be skipped by the text reader while their original bytes remain archived. JSONL records over 1 MiB and JSON documents over 32 MiB are skipped by the relevant readers; inspect `skipped_records` when an empty result matters. For JSON documents, `line` is a message ordinal rather than a physical file line.
 
@@ -112,7 +112,7 @@ sessioncrate restore ARCHIVE_ID --execute          # original recorded location
 
 A unique archive-ID prefix is accepted. SHA-256 and compressed/member integrity checks complete before an archive is accepted for restoration. Restore refuses existing files with different bytes and leaves equal files in place. Original paths, bytes, permissions, and modification times are recorded where the source format supports them.
 
-`list` reports valid entries alongside manifest errors, and `verify` aggregates failures. An unrelated damaged manifest does not block full-ID recovery of an intact archive. A damaged matching prefix requires the full intact ID or an explicit tool scope. Integrity and operational errors return exit code `2`.
+`list` reports valid entries alongside manifest errors, and `verify` aggregates failures. If one archive namespace cannot be searched, `search` returns healthy namespaces' matches with `partial: true` and `errors`; human output also identifies the failed namespace. An unrelated damaged manifest does not block full-ID recovery of an intact archive. A damaged matching prefix requires the full intact ID or an explicit tool scope. Integrity and operational errors, including partial searches, return exit code `2`.
 
 Grouped restore uses a private staging directory near the destination. A crash can leave a `.codex-vault-restore-stage-*` plaintext staging directory; there is no automatic crash scavenger. Multiple session roots are not published as one filesystem transaction. Compression is not encryption.
 

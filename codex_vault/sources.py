@@ -286,16 +286,37 @@ def _group(tool: str, root: Path, session_id: str, files: list[str], roots: list
     )
 
 
+def _unreadable_group(tool: str, root: Path, relative: str, *, cwd: str = "") -> SessionGroup:
+    return _group(
+        tool,
+        root,
+        f"unreadable:{relative}",
+        [],
+        [relative],
+        cwd=cwd,
+        notes=[f"unreadable directory: {relative}"],
+    )
+
+
 def _discover_claude(root: Path) -> list[SessionGroup]:
     projects = root / "projects"
     if not projects.is_dir() or projects.is_symlink():
         return []
     groups: list[SessionGroup] = []
-    for project_entry in sorted(os.scandir(projects), key=lambda entry: entry.name):
+    try:
+        project_entries = sorted(os.scandir(projects), key=lambda entry: entry.name)
+    except OSError:
+        return [_unreadable_group("claude", root, _rel(root, projects))]
+    for project_entry in project_entries:
         project = Path(project_entry.path)
-        if project_entry.is_symlink() or not project_entry.is_dir(follow_symlinks=False):
+        try:
+            if project_entry.is_symlink() or not project_entry.is_dir(follow_symlinks=False):
+                continue
+            entries = sorted(os.scandir(project), key=lambda item: item.name)
+        except OSError:
+            groups.append(_unreadable_group("claude", root, _rel(root, project)))
             continue
-        for entry in sorted(os.scandir(project), key=lambda item: item.name):
+        for entry in entries:
             main = Path(entry.path)
             if not entry.name.endswith(".jsonl"):
                 continue
@@ -327,10 +348,19 @@ def _discover_grok(root: Path) -> list[SessionGroup]:
     if not sessions.is_dir() or sessions.is_symlink():
         return []
     groups: list[SessionGroup] = []
-    for project in sorted(sessions.iterdir(), key=lambda path: path.name):
-        if project.is_symlink() or not project.is_dir():
+    try:
+        projects = sorted(sessions.iterdir(), key=lambda path: path.name)
+    except OSError:
+        return [_unreadable_group("grok", root, _rel(root, sessions))]
+    for project in projects:
+        try:
+            if project.is_symlink() or not project.is_dir():
+                continue
+            sessions_in_project = sorted(project.iterdir(), key=lambda path: path.name)
+        except OSError:
+            groups.append(_unreadable_group("grok", root, _rel(root, project), cwd=_decoded_cwd(project.name)))
             continue
-        for session in sorted(project.iterdir(), key=lambda path: path.name):
+        for session in sessions_in_project:
             rel = _rel(root, session)
             if session.is_symlink():
                 groups.append(_group("grok", root, session.name, [], [rel], cwd=_decoded_cwd(project.name), notes=[f"symlink session root: {rel}"]))
@@ -345,11 +375,20 @@ def _discover_gemini(root: Path) -> list[SessionGroup]:
     if not chats_root.is_dir() or chats_root.is_symlink():
         return []
     groups: list[SessionGroup] = []
-    for project in sorted(chats_root.iterdir(), key=lambda path: path.name):
+    try:
+        projects = sorted(chats_root.iterdir(), key=lambda path: path.name)
+    except OSError:
+        return [_unreadable_group("gemini", root, _rel(root, chats_root))]
+    for project in projects:
         chats = project / "chats"
-        if project.is_symlink() or not chats.is_dir() or chats.is_symlink():
+        try:
+            if project.is_symlink() or not chats.is_dir() or chats.is_symlink():
+                continue
+            entries = sorted(chats.iterdir(), key=lambda path: path.name)
+        except OSError:
+            groups.append(_unreadable_group("gemini", root, _rel(root, chats)))
             continue
-        for entry in sorted(chats.iterdir(), key=lambda path: path.name):
+        for entry in entries:
             if not entry.name.startswith("session-") or entry.suffix not in {".json", ".jsonl"}:
                 continue
             rel = _rel(root, entry)
@@ -473,14 +512,19 @@ def _record_text(record: Any, format: str) -> tuple[str, str] | None:
     if format == "grok-acp-jsonl":
         envelope: Any = record.get("update", record)
         if envelope is record:
+            wrapped_update = False
             for wrapper in ("params", "data"):
                 candidate = record.get(wrapper)
                 if isinstance(candidate, dict) and "update" in candidate:
                     envelope = candidate["update"]
+                    wrapped_update = True
                     break
-                if candidate is not None:
-                    envelope = candidate
-                    break
+            if not wrapped_update:
+                for wrapper in ("params", "data"):
+                    candidate = record.get(wrapper)
+                    if candidate is not None:
+                        envelope = candidate
+                        break
         session_update = envelope.get("sessionUpdate") if isinstance(envelope, dict) else None
         if isinstance(session_update, str):
             update_kind = session_update

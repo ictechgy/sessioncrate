@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import bisect
 import gzip
 import json
 import re
@@ -189,6 +188,8 @@ def _iter_readable(vault_dir: Path, manifest: dict) -> Iterator[tuple[int, str, 
                 raise VaultError(f"archive {archive_id} contains deeply nested JSON at line {line_number}") from error
             if readable is not None:
                 yield line_number, readable[0], readable[1]
+            else:
+                yield line_number, None, None
     except VaultError as error:
         # The storage helper deliberately hides low-level details behind a
         # VaultError. Normalize its blob-read diagnostic so callers receive a
@@ -202,19 +203,49 @@ def _iter_readable(vault_dir: Path, manifest: dict) -> Iterator[tuple[int, str, 
         raise VaultError(f"archive {archive_id} has corrupt gzip data") from error
 
 
-def _match_context(text: str, query: str) -> str:
-    folded_parts = [character.casefold() for character in text]
-    folded = "".join(folded_parts)
+def _casefold_span(text: str, query: str) -> tuple[int, int] | None:
+    """Return the original-text span of a literal case-insensitive match.
+
+    Unicode casefolding can expand one character into several characters (for
+    example, ``ß`` becomes ``ss``).  The folded text is searched as one string;
+    the matching offsets are then mapped back with a single pass over the
+    original text, avoiding per-character offset lists.
+    """
     folded_query = query.casefold()
-    position = folded.find(folded_query)
+    position = text.casefold().find(folded_query)
     if position < 0:
-        return ""
-    offsets = [0]
-    for part in folded_parts:
-        offsets.append(offsets[-1] + len(part))
-    start = max(0, bisect.bisect_right(offsets, position) - 1)
+        return None
+    if not folded_query:
+        return (0, 1 if text else 0)
+
     end_position = position + len(folded_query)
-    end = min(len(text), max(start + 1, bisect.bisect_left(offsets, end_position)))
+    folded_offset = 0
+    start: int | None = None
+    end: int | None = None
+    for index, character in enumerate(text):
+        next_offset = folded_offset + len(character.casefold())
+        if start is None and folded_offset <= position < next_offset:
+            start = index
+        if end is None and next_offset >= end_position:
+            end = index + 1
+        folded_offset = next_offset
+        if start is not None and end is not None:
+            break
+
+    # A non-empty folded query found in the folded text must map to at least
+    # one original character.  Keep a defensive fallback for unusual future
+    # Unicode casefold mappings that might not advance an offset.
+    if start is None:
+        return None
+    return start, end if end is not None else len(text)
+
+
+def _match_context(text: str, query: str) -> str:
+    span = _casefold_span(text, query)
+    if span is None:
+        return ""
+    start, end = span
+    end = min(len(text), max(start + 1, end))
     context = max(0, (MAX_SNIPPET_CHARS - (end - start)) // 2)
     window_start = max(0, start - context)
     window_end = min(len(text), window_start + MAX_SNIPPET_CHARS)
@@ -331,8 +362,9 @@ def show(vault_dir: Path, archive_id: str, limit: int = 100, query: str | None =
             continue
         if len(records) >= limit:
             truncated = True
-            for _ in iterator:
-                pass
+            for _, remaining_kind, _ in iterator:
+                if remaining_kind is None:
+                    skipped_records += 1
             break
         records.append({"kind": kind, "line": line_number, "text": text[:MAX_SNIPPET_CHARS]})
     return {"archive_id": resolved_archive_id, "records": records, "truncated": truncated, "skipped_records": skipped_records}

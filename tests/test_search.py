@@ -82,6 +82,12 @@ class SearchTests(unittest.TestCase):
     def _restore_storage_reader(self):
         search_module._storage_iter_archive_lines = self._storage_lines
 
+    def test_casefold_span_maps_unicode_expansions_without_per_character_offsets(self):
+        self.assertEqual(search_module._casefold_span("STRASSE", "straße"), (0, 7))
+        self.assertEqual(search_module._casefold_span("ß", "s"), (0, 1))
+        self.assertEqual(search_module._casefold_span("ß" * 1000 + "TARGET", "target"), (1000, 1006))
+        self.assertIsNone(search_module._casefold_span("straße", "missing"))
+
     def test_searches_readable_codex_records_and_filters_literal_unicode(self):
         records = [
             {"type": "response_item", "payload": {"type": "message", "content": [
@@ -154,6 +160,21 @@ class SearchTests(unittest.TestCase):
                 result = show(vault, manifest["archive_id"])
                 self.assertEqual([record["text"] for record in result["records"]], ["hello", "world"])
                 self.assertTrue(all("secret" not in record["text"] for record in result["records"]))
+
+    def test_unsupported_records_are_counted_even_after_result_limit(self):
+        records = [
+            {"type": "session_meta", "payload": {"id": "synthetic"}},
+            {"type": "event_msg", "payload": {"type": "user_message", "message": "needle one"}},
+            {"type": "event_msg", "payload": {"type": "agent_message", "message": "needle two"}},
+            {"type": "unknown_future_record", "payload": {"opaque": True}},
+        ]
+        with tempfile.TemporaryDirectory() as temp:
+            vault, manifest = _archive_fixture(Path(temp), records)
+            with patch("codex_vault.search.list_archives", return_value=[manifest]), \
+                 patch("codex_vault.search.resolve_archive", return_value=manifest):
+                for result in (search(vault, "needle", limit=1), show(vault, manifest["archive_id"], limit=1)):
+                    self.assertTrue(result["truncated"])
+                    self.assertEqual(result["skipped_records"], 2)
 
     def test_corrupt_gzip_and_invalid_json_are_explicit_errors(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -19,6 +19,7 @@ import tarfile
 import tempfile
 import time
 import uuid
+import zlib
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Callable, Iterator
@@ -26,6 +27,7 @@ from typing import Any, BinaryIO, Callable, Iterator
 from . import activity
 from . import sources
 from . import storage
+from .search import _casefold_span
 
 
 VaultError = storage.VaultError
@@ -436,6 +438,49 @@ def _identity_stat(st: os.stat_result) -> tuple[int, int, int, int, int, int]:
     return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns, stat.S_IMODE(st.st_mode))
 
 
+class _RestoreIdentityCache(dict[str, tuple[int, int, int, int, int, int]]):
+    """Verified destination identities shared by a restore's preflight walks.
+
+    ``trusted_files`` predates this cache and means files published by the
+    current restore.  Keep that mapping shape for callers while tracking the
+    narrower publication set separately: an equal pre-existing file may be
+    rehashed when its identity changes, whereas a file published by this
+    restore must still fail the final identity barrier.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.published_paths: set[str] = set()
+
+
+def _cache_file_is_published(
+    trusted_files: dict[str, tuple[int, int, int, int, int, int]], relative: str
+) -> bool:
+    published_paths = getattr(trusted_files, "published_paths", None)
+    # Plain dictionaries are the legacy ``trusted_files`` interface: every
+    # supplied identity is trusted as a just-published file.
+    return published_paths is None or relative in published_paths
+
+
+def _hash_and_cache_destination(
+    target: Path,
+    entry: dict[str, Any],
+    trusted_files: dict[str, tuple[int, int, int, int, int, int]] | None,
+) -> tuple[int, int, int, int, int, int]:
+    """Hash a destination and only cache it after a post-hash identity check."""
+
+    digest, size, before = storage._hash_path(target)
+    after = storage._safe_regular(target, label="destination member")
+    if _identity_stat(after) != _identity_stat(before):
+        raise VaultError(f"destination member changed while checking: {entry['path']}")
+    if digest != entry["sha256"] or size != entry["size"]:
+        raise VaultError(f"destination already contains different bytes: {entry['path']}")
+    identity = _identity_stat(after)
+    if trusted_files is not None:
+        trusted_files[entry["path"]] = identity
+    return identity
+
+
 class _HashingReader:
     def __init__(self, stream: BinaryIO) -> None:
         self.stream = stream
@@ -642,8 +687,13 @@ def _stream_verified_blob(
                             raise VaultError("bundle tar member has no data")
                         if record_callback is not None:
                             reader = _HashingReader(stream)
-                            for record in sources.iter_text_records(reader, entry["format"]):
-                                record_callback(entry, dict(record))
+                            try:
+                                for record in sources.iter_text_records(reader, entry["format"]):
+                                    record_callback(entry, dict(record))
+                            except VaultError:
+                                raise
+                            except ValueError as exc:
+                                raise VaultError("bundle text record decoding/processing failed") from exc
                             while reader.read(1024 * 1024):
                                 pass
                             if reader.digest.hexdigest() != entry["sha256"] or reader.total != entry["size"]:
@@ -693,7 +743,7 @@ def _stream_verified_blob(
         return raw_total, staged
     except VaultError:
         raise
-    except (OSError, tarfile.TarError, EOFError, ValueError) as exc:
+    except (OSError, tarfile.TarError, EOFError, ValueError, zlib.error) as exc:
         if isinstance(exc, VaultError):
             raise
         raise VaultError("bundle tar.gz is corrupt") from exc
@@ -960,6 +1010,7 @@ def _restore_preflight(
 ) -> dict[str, str]:
     if manifest["source_mode"] == "native":
         return _restore_native_preflight(root, manifest, trusted_files)
+    cached_files = trusted_files if trusted_files is not None else {}
     conflicts: dict[str, str] = {}
     for directory in manifest["directories"]:
         target_directory = root.joinpath(*PurePosixPath(directory["path"]).parts)
@@ -977,15 +1028,15 @@ def _restore_preflight(
             continue
         if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
             raise VaultError(f"destination member is unsafe: {entry['path']}")
-        trusted_identity = (trusted_files or {}).get(entry["path"])
+        trusted_identity = cached_files.get(entry["path"])
         if trusted_identity is not None:
-            if _identity_stat(st) != trusted_identity:
+            if _identity_stat(st) == trusted_identity:
+                conflicts[entry["path"]] = "equal"
+                continue
+            if _cache_file_is_published(cached_files, entry["path"]):
                 raise VaultError(f"destination member changed after publication: {entry['path']}")
-            conflicts[entry["path"]] = "equal"
-            continue
-        digest, size, _ = storage._hash_path(target)
-        if digest != entry["sha256"] or size != entry["size"]:
-            raise VaultError(f"destination already contains different bytes: {entry['path']}")
+            cached_files.pop(entry["path"], None)
+        _hash_and_cache_destination(target, entry, cached_files)
         conflicts[entry["path"]] = "equal"
     return conflicts
 
@@ -996,6 +1047,7 @@ def _restore_native_preflight(
     trusted_files: dict[str, tuple[int, int, int, int, int, int]] | None = None,
 ) -> dict[str, str]:
     equal: dict[str, str] = {}
+    cached_files = trusted_files if trusted_files is not None else {}
     expected_files = {item["path"]: item for item in manifest["files"]}
     expected_directories = {item["path"] for item in manifest["directories"]}
     for root_relative in manifest["root_entries"]:
@@ -1047,16 +1099,17 @@ def _restore_native_preflight(
             raise VaultError(f"destination native root is partial or has unexpected members: {root_relative}")
         for relative, item in root_files.items():
             target = root.joinpath(*PurePosixPath(relative).parts)
-            trusted_identity = (trusted_files or {}).get(relative)
+            trusted_identity = cached_files.get(relative)
             if trusted_identity is not None:
                 target_stat = _lstat(target)
                 if target_stat is None or _identity_stat(target_stat) != trusted_identity:
-                    raise VaultError(f"destination member changed after publication: {relative}")
-                equal[relative] = "equal"
-                continue
-            digest, size, _ = storage._hash_path(target)
-            if digest != item["sha256"] or size != item["size"]:
-                raise VaultError(f"destination already contains different bytes: {relative}")
+                    if _cache_file_is_published(cached_files, relative):
+                        raise VaultError(f"destination member changed after publication: {relative}")
+                    cached_files.pop(relative, None)
+                else:
+                    equal[relative] = "equal"
+                    continue
+            _hash_and_cache_destination(target, item, cached_files)
             equal[relative] = "equal"
     return equal
 
@@ -1208,7 +1261,8 @@ def restore(vault_dir: Path, archive_id: str, destination_home: Path | None = No
             raise VaultError("bundle namespace does not exist")
         manifest = _resolve(bundle_root, archive_id)
         root = _destination_root(Path(destination_home) if destination_home is not None else Path(manifest["source_root"]), False)
-        equal = _restore_preflight(root, manifest)
+        trusted_files = _RestoreIdentityCache()
+        equal = _restore_preflight(root, manifest, trusted_files)
         result = {"ok": True, "execute": bool(execute), "executed": bool(execute), "archive_id": manifest["archive_id"], "restored": [], "skipped": list(equal)}
         if not execute:
             check = _verify_blob(bundle_root, manifest)
@@ -1222,7 +1276,7 @@ def restore(vault_dir: Path, archive_id: str, destination_home: Path | None = No
             # Extraction can take time. Re-run the complete destination
             # preflight before creating anything so a tool that resumed in
             # the meantime cannot be overlaid with a native session.
-            equal = _restore_preflight(root, manifest)
+            equal = _restore_preflight(root, manifest, trusted_files)
             result["skipped"] = list(equal)
             storage._mkdir_private(root, tighten_existing=False)
             for directory in sorted(manifest["directories"], key=lambda item: len(PurePosixPath(item["path"]).parts)):
@@ -1253,15 +1307,16 @@ def restore(vault_dir: Path, archive_id: str, destination_home: Path | None = No
                         target_stat = _lstat(target)
                         if target_stat is None or stat.S_ISLNK(target_stat.st_mode) or not stat.S_ISREG(target_stat.st_mode):
                             raise VaultError(f"destination race produced an unsafe member: {entry['path']}")
-                        digest, size, _ = storage._hash_path(target)
-                        if digest != entry["sha256"] or size != entry["size"]:
-                            raise VaultError(f"destination race produced different bytes: {entry['path']}")
+                        _hash_and_cache_destination(target, entry, trusted_files)
                         result["skipped"].append(entry["path"])
                     storage._fsync_directory(target.parent)
                 except Exception:
                     temp.unlink(missing_ok=True)
                     raise
-            trusted_files = {target.relative_to(root).as_posix(): identity for target, identity in published_files}
+            for target, identity in published_files:
+                relative = target.relative_to(root).as_posix()
+                trusted_files[relative] = identity
+                trusted_files.published_paths.add(relative)
             _restore_preflight(root, manifest, trusted_files)
             for directory in sorted(created_directories, key=lambda item: len(PurePosixPath(item["relative_path"]).parts), reverse=True):
                 _apply_restore_directory_metadata(directory)
@@ -1666,25 +1721,44 @@ def _prune_one(vault: Path, bundle_root: Path, manifest: dict[str, Any], result:
         result["skipped"].append({"archive_id": manifest["archive_id"], "reason": "group roots do not share a parent"})
         return
     parent = next(iter(parent_dirs))
-    parent_before = _lstat(parent)
-    if parent_before is None:
-        raise VaultError("bundle root parent disappeared")
-    root_stats = {relative: _lstat(root.joinpath(*PurePosixPath(relative).parts)) for relative in manifest["root_entries"]}
-    if any(stat_item is None for stat_item in root_stats.values()):
-        raise VaultError("bundle root entry disappeared before quarantine")
-    for left in manifest["root_entries"]:
-        for right in manifest["root_entries"]:
-            if left != right and right.startswith(left + "/"):
-                raise VaultError("bundle root entries overlap")
     quarantine = parent / f".codex-vault-pending-bundle-{uuid.uuid4().hex}"
-    storage._mkdir_private(quarantine)
+    try:
+        parent_before = _lstat(parent)
+        if parent_before is None:
+            raise VaultError("bundle root parent disappeared")
+        root_stats = {relative: _lstat(root.joinpath(*PurePosixPath(relative).parts)) for relative in manifest["root_entries"]}
+        if any(stat_item is None for stat_item in root_stats.values()):
+            raise VaultError("bundle root entry disappeared before quarantine")
+        for left in manifest["root_entries"]:
+            for right in manifest["root_entries"]:
+                if left != right and right.startswith(left + "/"):
+                    raise VaultError("bundle root entries overlap")
+        storage._mkdir_private(quarantine)
+    except (VaultError, OSError) as exc:
+        skipped = {
+            "archive_id": manifest["archive_id"],
+            "reason": f"bundle prune setup failed: {exc}",
+        }
+        # The unique path may have been created before setup failed. Preserve
+        # anything at that path because ownership and contents are uncertain.
+        try:
+            quarantine_stat = _lstat(quarantine)
+        except OSError:
+            quarantine_stat = None
+            skipped["quarantine"] = str(quarantine)
+        if quarantine_stat is not None:
+            skipped["quarantine"] = str(quarantine)
+        result["skipped"].append(skipped)
+        return
     moved: list[tuple[Path, Path]] = []
+    deletion_completed = False
     try:
         for relative in manifest["root_entries"]:
             original = root.joinpath(*PurePosixPath(relative).parts)
             staged = quarantine / original.name
             os.rename(original, staged)
             moved.append((original, staged))
+        storage._fsync_directory(parent)
         parent_after = _lstat(parent)
         if parent_after is None or (parent_after.st_dev, parent_after.st_ino) != (parent_before.st_dev, parent_before.st_ino):
             raise VaultError("bundle root parent changed during quarantine")
@@ -1703,8 +1777,8 @@ def _prune_one(vault: Path, bundle_root: Path, manifest: dict[str, Any], result:
             result["skipped"].append({"archive_id": manifest["archive_id"], "activity": "unknown", "reason": "new source root path appeared during quarantine", "quarantine": str(quarantine)})
             return
         _remove_quarantine_exact(quarantine, manifest)
-        result["removed"].append(manifest["archive_id"])
-        result["removed_source_bytes"] += manifest["raw_bytes"]
+        deletion_completed = True
+        storage._fsync_directory(parent)
     except _QuarantineRemovalStarted as exc:
         result["skipped"].append(
             {
@@ -1715,10 +1789,18 @@ def _prune_one(vault: Path, bundle_root: Path, manifest: dict[str, Any], result:
             }
         )
         raise
-    except (VaultError, OSError):
+    except (VaultError, OSError) as exc:
+        if deletion_completed:
+            result["removed"].append(manifest["archive_id"])
+            result["removed_source_bytes"] += manifest["raw_bytes"]
+            raise VaultError(
+                f"bundle source was removed but parent directory durability is uncertain: {parent}"
+            ) from exc
         result["archive_id"] = manifest["archive_id"]
         _restore_quarantine(moved, quarantine, result, "bundle prune failed; quarantine retained for recovery")
         return
+    result["removed"].append(manifest["archive_id"])
+    result["removed_source_bytes"] += manifest["raw_bytes"]
 
 
 def prune(vault_dir: Path, archive_id: str | None = None, execute: bool = False, tool: str | None = None) -> dict[str, Any]:
@@ -1758,18 +1840,10 @@ def prune(vault_dir: Path, archive_id: str | None = None, execute: bool = False,
 
 
 def _snippet(text: str, query: str, limit: int = 240) -> str:
-    folded_parts: list[str] = []
-    original_positions: list[int] = []
-    for index, character in enumerate(text):
-        folded_character = character.casefold()
-        folded_parts.append(folded_character)
-        original_positions.extend([index] * len(folded_character))
-    folded = "".join(folded_parts)
-    position = folded.find(query.casefold())
-    if position < 0:
+    span = _casefold_span(text, query)
+    if span is None:
         return text[:limit]
-    original_position = original_positions[position] if position < len(original_positions) else len(text)
-    start = max(0, original_position - limit // 3)
+    start = max(0, span[0] - limit // 3)
     return ("…" if start else "") + text[start : start + limit]
 
 

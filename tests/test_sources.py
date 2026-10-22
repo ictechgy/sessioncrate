@@ -118,6 +118,120 @@ class SourceAdapterTests(unittest.TestCase):
             encoded_group = next(item for item in discover("grok", root) if item.session_id == "session-2")
             self.assertEqual(encoded_group.cwd, "/work/app")
 
+    def test_native_discovery_keeps_healthy_siblings_when_project_is_unreadable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+
+            claude_root = base / "claude"
+            claude_bad = claude_root / "projects" / "bad"
+            claude_good = claude_root / "projects" / "good"
+            claude_bad.mkdir(parents=True)
+            claude_good.mkdir(parents=True)
+            (claude_good / "healthy.jsonl").write_text('{}\n', encoding="utf-8")
+            real_scandir = os.scandir
+
+            def claude_scandir(path):
+                if Path(path) == claude_bad:
+                    raise PermissionError("synthetic unreadable Claude project")
+                return real_scandir(path)
+
+            with mock.patch("codex_vault.sources.os.scandir", side_effect=claude_scandir):
+                claude_groups = discover("claude", claude_root)
+            claude_bad_group = next(group for group in claude_groups if "bad" in group.root_entries[0])
+            self.assertFalse(claude_bad_group.files)
+            self.assertFalse(claude_bad_group.removable)
+            self.assertTrue(any("unreadable directory" in note for note in claude_bad_group.notes))
+            self.assertTrue(any(group.files == ("projects/good/healthy.jsonl",) for group in claude_groups))
+
+            grok_root = base / "grok"
+            grok_bad = grok_root / "sessions" / "bad"
+            grok_good = grok_root / "sessions" / "good"
+            grok_bad.mkdir(parents=True)
+            (grok_good / "healthy").mkdir(parents=True)
+            (grok_good / "healthy" / "updates.jsonl").write_text('{}\n', encoding="utf-8")
+            real_iterdir = Path.iterdir
+
+            def grok_iterdir(path):
+                if path == grok_bad:
+                    raise PermissionError("synthetic unreadable Grok project")
+                return real_iterdir(path)
+
+            with mock.patch.object(Path, "iterdir", grok_iterdir):
+                grok_groups = discover("grok", grok_root)
+            grok_bad_group = next(group for group in grok_groups if "sessions/bad" in group.root_entries[0])
+            self.assertFalse(grok_bad_group.files)
+            self.assertFalse(grok_bad_group.removable)
+            self.assertTrue(any("unreadable directory" in note for note in grok_bad_group.notes))
+            self.assertTrue(any(group.files == ("sessions/good/healthy/updates.jsonl",) for group in grok_groups))
+
+            gemini_root = base / "gemini"
+            gemini_bad = gemini_root / "tmp" / "bad" / "chats"
+            gemini_good = gemini_root / "tmp" / "good" / "chats"
+            gemini_bad.mkdir(parents=True)
+            gemini_good.mkdir(parents=True)
+            (gemini_good / "session-healthy.json").write_text('{}', encoding="utf-8")
+
+            def gemini_iterdir(path):
+                if path == gemini_bad:
+                    raise PermissionError("synthetic unreadable Gemini project")
+                return real_iterdir(path)
+
+            with mock.patch.object(Path, "iterdir", gemini_iterdir):
+                gemini_groups = discover("gemini", gemini_root)
+            gemini_bad_group = next(group for group in gemini_groups if "tmp/bad/chats" in group.root_entries[0])
+            self.assertFalse(gemini_bad_group.files)
+            self.assertFalse(gemini_bad_group.removable)
+            self.assertTrue(any("unreadable directory" in note for note in gemini_bad_group.notes))
+            self.assertTrue(any(group.files == ("tmp/good/chats/session-healthy.json",) for group in gemini_groups))
+
+    def test_native_discovery_reports_inaccessible_top_level_scope(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+
+            claude_root = base / "claude"
+            (claude_root / "projects").mkdir(parents=True)
+            real_scandir = os.scandir
+
+            def blocked_scandir(path):
+                if Path(path) == claude_root / "projects":
+                    raise PermissionError("synthetic unreadable Claude projects")
+                return real_scandir(path)
+
+            with mock.patch("codex_vault.sources.os.scandir", side_effect=blocked_scandir):
+                claude_groups = discover("claude", claude_root)
+            self.assertEqual(len(claude_groups), 1)
+            self.assertFalse(claude_groups[0].removable)
+            self.assertTrue(any("projects" in note for note in claude_groups[0].notes))
+
+            grok_root = base / "grok"
+            (grok_root / "sessions").mkdir(parents=True)
+            real_iterdir = Path.iterdir
+
+            def blocked_grok_iterdir(path):
+                if path == grok_root / "sessions":
+                    raise PermissionError("synthetic unreadable Grok sessions")
+                return real_iterdir(path)
+
+            with mock.patch.object(Path, "iterdir", blocked_grok_iterdir):
+                grok_groups = discover("grok", grok_root)
+            self.assertEqual(len(grok_groups), 1)
+            self.assertFalse(grok_groups[0].removable)
+            self.assertTrue(any("sessions" in note for note in grok_groups[0].notes))
+
+            gemini_root = base / "gemini"
+            (gemini_root / "tmp").mkdir(parents=True)
+
+            def blocked_gemini_iterdir(path):
+                if path == gemini_root / "tmp":
+                    raise PermissionError("synthetic unreadable Gemini tmp")
+                return real_iterdir(path)
+
+            with mock.patch.object(Path, "iterdir", blocked_gemini_iterdir):
+                gemini_groups = discover("gemini", gemini_root)
+            self.assertEqual(len(gemini_groups), 1)
+            self.assertFalse(gemini_groups[0].removable)
+            self.assertTrue(any("tmp" in note for note in gemini_groups[0].notes))
+
     def test_gemini_and_exports_are_scoped_without_databases(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -299,6 +413,30 @@ class SourceAdapterTests(unittest.TestCase):
 
         self.assertEqual(texts, ["visible user"])
         self.assertEqual(sum(record.get("reason") == "no readable text" for record in records), 4)
+
+    def test_grok_wrapper_prefers_explicit_updates_over_metadata_fallbacks(self):
+        lines = [
+            {"update": {"sessionUpdate": {"kind": "user_message_chunk", "content": {"text": "direct update"}}}, "params": {"label": "ignored"}},
+            {"params": {"update": {"sessionUpdate": {"kind": "user_message_chunk", "content": {"text": "params update"}}}}},
+            {"params": {"label": "metadata"}, "data": {"update": {"sessionUpdate": {"kind": "user_message_chunk", "content": {"text": "data update"}}}}},
+            {"params": {"sessionUpdate": {"kind": "user_message_chunk", "content": {"text": "params fallback"}}}},
+            {"data": {"sessionUpdate": {"kind": "user_message_chunk", "content": {"text": "data fallback"}}}},
+            {"params": {"label": "metadata"}, "data": {"update": {"sessionUpdate": {"kind": "agent_thought_chunk", "content": {"text": "private data update"}}}}},
+        ]
+        data = b"\n".join(json.dumps(line).encode() for line in lines) + b"\n"
+
+        records = list(iter_text_records(io.BytesIO(data), "grok-acp-jsonl"))
+        texts = [record["text"] for record in records if "text" in record]
+
+        self.assertEqual(texts, [
+            "direct update",
+            "params update",
+            "data update",
+            "params fallback",
+            "data fallback",
+        ])
+        self.assertNotIn("metadata", texts)
+        self.assertEqual(records[-1], {"line": 6, "skipped": True, "reason": "no readable text"})
 
     @unittest.skipUnless(_supports_large_integer_limit_test(), "interpreter has no bounded integer conversion limit")
     def test_jsonl_large_integer_skips_record_and_continues(self):

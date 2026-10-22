@@ -18,6 +18,7 @@ import stat
 import tempfile
 import time
 import uuid
+import zlib
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -572,7 +573,15 @@ def _resolve_archive_unlocked(vault: Path, archive_id: str) -> dict[str, Any]:
         exact_path = _manifest_path(vault, archive_id)
         if _lstat(exact_path) is not None:
             return _read_manifest_path(exact_path, expected_id=archive_id)
-    matches = [item for item in _iter_valid_manifests(vault) if item["archive_id"].startswith(archive_id)]
+    matching_paths = [
+        path
+        for path in _iter_manifest_paths(vault)
+        if path.name[:-5].startswith(archive_id)
+    ]
+    matches = [
+        _read_manifest_path(path, expected_id=path.name[:-5])
+        for path in matching_paths
+    ]
     if not matches:
         raise VaultError(f"archive not found: {archive_id}")
     if len(matches) > 1:
@@ -642,7 +651,7 @@ def iter_archive_lines(
                         if not line:
                             break
                     yield line_number, None
-    except (OSError, EOFError, gzip.BadGzipFile) as exc:
+    except (OSError, EOFError, gzip.BadGzipFile, zlib.error) as exc:
         raise VaultError(f"cannot read archive blob: {blob}: {exc}") from exc
 
 
@@ -734,7 +743,7 @@ def _verify_gzip(path: Path, expected_sha: str, expected_size: int) -> None:
                     break
                 digest.update(chunk)
                 total += len(chunk)
-    except (OSError, EOFError, gzip.BadGzipFile) as exc:
+    except (OSError, EOFError, gzip.BadGzipFile, zlib.error) as exc:
         raise VaultError(f"archive blob is corrupt or truncated: {path}: {exc}") from exc
     if total != expected_size or digest.hexdigest() != expected_sha:
         raise VaultError(f"archive blob digest or size mismatch: {path}")
@@ -906,6 +915,9 @@ def _archive_candidate(
         source_stat = _safe_regular(source, label="source")
         if source_stat.st_size != item["size"] or source_stat.st_mtime_ns != item["mtime_ns"]:
             raise VaultError(f"source changed after scan: {source}")
+        source_mode = stat.S_IMODE(source_stat.st_mode)
+        if source_mode > 0o1777:
+            raise VaultError(f"source mode is unsupported: {oct(source_mode)}")
         if remove_originals and time.time_ns() - source_stat.st_mtime_ns < _HOUR_NS:
             raise VaultError(f"source must be at least one hour old before removal: {source}")
         temp, sha, raw_bytes, metadata = _stream_archive(source, blobs, source_stat)
@@ -918,6 +930,7 @@ def _archive_candidate(
             source_stat=source_stat,
             metadata=metadata,
         )
+        manifest = _valid_manifest(manifest)
         existing_manifest = _existing_manifest(vault, manifest["archive_id"])
         if existing_manifest is not None:
             if existing_manifest["blob_sha256"] != sha or existing_manifest["raw_bytes"] != raw_bytes:
@@ -1013,6 +1026,14 @@ def archive(
             for manifest in result["archived"]:
                 try:
                     source = _source_path_for_manifest(manifest)
+                except (VaultError, OSError) as error:
+                    result["skipped"].append({
+                        "archive_id": manifest["archive_id"],
+                        "relative_path": manifest["relative_path"],
+                        "reason": str(error),
+                    })
+                    continue
+                try:
                     _remove_source_atomically(source, manifest)
                 except SessionActivityBlocked as error:
                     result["skipped"].append({
@@ -1153,7 +1174,7 @@ def restore(
                         total += len(chunk)
                     output.flush()
                     os.fsync(output.fileno())
-            except (OSError, EOFError, gzip.BadGzipFile) as exc:
+            except (OSError, EOFError, gzip.BadGzipFile, zlib.error) as exc:
                 raise VaultError(f"archive blob is corrupt during restore: {exc}") from exc
             if total != manifest["raw_bytes"] or digest.hexdigest() != manifest["blob_sha256"]:
                 raise VaultError("archive digest changed during restore")
@@ -1200,7 +1221,7 @@ def _source_matches_manifest(path: Path, manifest: dict[str, Any]) -> tuple[bool
         if size != manifest["raw_bytes"] or sha != manifest["blob_sha256"]:
             return False, "source bytes changed"
         return True, "eligible"
-    except VaultError as exc:
+    except (VaultError, OSError) as exc:
         return False, str(exc)
 
 
@@ -1273,6 +1294,7 @@ def _remove_source_atomically(path: Path, manifest: dict[str, Any]) -> None:
         os.rename(path, pending)
     except OSError as exc:
         raise _SourceRemovalSkipped(f"could not quarantine source before removal: {path}: {exc}") from exc
+    pending_removed = False
     try:
         # Query the renamed file as well: an existing writer still refers to
         # its inode. Check before opening our own verification descriptor.
@@ -1299,10 +1321,16 @@ def _remove_source_atomically(path: Path, manifest: dict[str, Any]) -> None:
             if final_stat is None or _stat_identity(final_stat) != _stat_identity(after_hash_stat):
                 raise VaultError("quarantined source changed before removal")
             os.unlink(pending)
+            pending_removed = True
         finally:
             os.close(pending_fd)
         _fsync_directory(path.parent)
     except Exception as exc:
+        if pending_removed:
+            raise VaultError(
+                "source was removed but removal durability could not be confirmed; "
+                f"verified archive retained for restore: {path}: {exc}"
+            ) from exc
         # Never overwrite a path that appeared while the source was quarantined,
         # and never move a changed or symlink replacement back into it.  A
         # quarantine left behind is recoverable by the user and is safer than
@@ -1353,7 +1381,7 @@ def prune(vault_dir: Path, archive_id: str | None = None, execute: bool = False)
                 continue
             try:
                 source = _source_path_for_manifest(manifest)
-            except VaultError as exc:
+            except (VaultError, OSError) as exc:
                 entries.append({"archive_id": manifest["archive_id"], "relative_path": manifest["relative_path"], "eligible": False, "reason": str(exc)})
                 continue
             matches, reason = _source_matches_manifest(source, manifest)
@@ -1384,7 +1412,13 @@ def prune(vault_dir: Path, archive_id: str | None = None, execute: bool = False)
             by_id = {manifest["archive_id"]: manifest for manifest in manifests}
             for entry in selected:
                 try:
-                    _remove_source_atomically(_source_path_for_manifest(by_id[entry["archive_id"]]), by_id[entry["archive_id"]])
+                    source = _source_path_for_manifest(by_id[entry["archive_id"]])
+                except (VaultError, OSError) as error:
+                    entry.update(eligible=False, reason=str(error))
+                    result["skipped"].append(entry)
+                    continue
+                try:
+                    _remove_source_atomically(source, by_id[entry["archive_id"]])
                 except SessionActivityBlocked as error:
                     entry.update(eligible=False, activity=error.state, reason=str(error))
                     result["skipped"].append(entry)

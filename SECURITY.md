@@ -4,7 +4,7 @@ SessionCrate is early alpha. It handles potentially private conversation and too
 
 The runtime CLI makes no network requests. Search results and manifests can still contain sensitive conversation text, project names, paths and identifiers. Keep archives, manifests, quarantines, search results and local validation reports private.
 
-Original reclamation is explicit and checks the archived bytes, current source, activity probes and quarantine contents. Open-file checks do not prove logical session inactivity. Do not use or reopen the selected session during cleanup. Unknown activity preserves the selected original. Native application resume is not a verified guarantee.
+Original reclamation is explicit and checks the archived bytes, current source, activity probes and quarantine contents. Open-file checks do not prove logical session inactivity and are limited by the invoking user's permissions and process visibility. Do not use or reopen the selected session during cleanup. Unknown activity preserves the selected original. Native application resume is not a verified guarantee.
 
 Do not remove a retained quarantine just to make a retry succeed. Preserve it and the archive, then reproduce the failure with synthetic data. Crashes can leave a private destination-adjacent plaintext restore stage; automatic crash cleanup is not provided.
 

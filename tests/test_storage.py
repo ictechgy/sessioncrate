@@ -243,7 +243,14 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(manifest_path.read_bytes(), original_manifest)
         self.assertTrue(storage.verify(vault, manifest["archive_id"])["ok"])
 
-    def test_unsupported_timestamp_never_publishes_or_replaces_manifest(self) -> None:
+    def test_invalid_manifest_metadata_never_publishes_or_replaces_manifest(self) -> None:
+        real_manifest = storage._new_manifest
+
+        def invalid_manifest(**kwargs):
+            manifest = real_manifest(**kwargs)
+            manifest["source_mtime_ns"] = -1
+            return manifest
+
         for existing in (False, True):
             with self.subTest(existing=existing):
                 base = self.tmp_path / str(existing)
@@ -254,8 +261,10 @@ class StorageTests(unittest.TestCase):
                     storage.archive(home, vault, older_than_days=1, execute=True)
                 before = {path.relative_to(vault): path.read_bytes()
                           for path in vault.rglob('*') if path.is_file() and path.name != '.lock'}
-                os.utime(source, ns=(-1, -1))
-                result = storage.archive(home, vault, older_than_days=1, execute=True)
+                # Inject invalid snapshot metadata directly: macOS filesystems
+                # do not consistently preserve a negative nanosecond utime.
+                with mock.patch.object(storage, "_new_manifest", side_effect=invalid_manifest):
+                    result = storage.archive(home, vault, older_than_days=1, execute=True)
                 self.assertEqual(result["archived"], [])
                 self.assertTrue(result["errors"])
                 after = {path.relative_to(vault): path.read_bytes()

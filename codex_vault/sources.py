@@ -482,10 +482,22 @@ def _record_text(record: Any, format: str) -> tuple[str, str] | None:
                     envelope = candidate
                     break
         session_update = envelope.get("sessionUpdate") if isinstance(envelope, dict) else None
-        update_kind = session_update.get("kind") if isinstance(session_update, dict) else None
+        if isinstance(session_update, str):
+            update_kind = session_update
+        elif isinstance(session_update, dict):
+            update_kind = session_update.get("kind")
+        else:
+            update_kind = None
         if update_kind in {"agent_thought_chunk", "hook_execution"}:
             return None
-        parts = _text_parts(envelope)
+        if isinstance(envelope, dict):
+            parts = _text_parts({
+                key: value
+                for key, value in envelope.items()
+                if not (key == "sessionUpdate" and isinstance(value, str))
+            })
+        else:
+            parts = _text_parts(envelope)
         return (str(record.get("type", "grok")), " ".join(parts)) if parts else None
     parts = _text_parts(record)
     return (str(record.get("type", record.get("role", "record"))), " ".join(parts)) if parts else None
@@ -510,9 +522,17 @@ def _jsonl_records(stream: BinaryIO, format: str, max_record_bytes: int) -> Iter
             yield _skip(line_number, "record exceeds maximum size")
             continue
         try:
-            record = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
+            decoded = raw.decode("utf-8")
+        except UnicodeDecodeError:
             yield _skip(line_number, "invalid JSON record")
+            continue
+        try:
+            record = json.loads(decoded)
+        except json.JSONDecodeError:
+            yield _skip(line_number, "invalid JSON record")
+            continue
+        except ValueError:
+            yield _skip(line_number, "unsupported JSON record")
             continue
         except RecursionError:
             yield _skip(line_number, "deeply nested JSON")
@@ -555,9 +575,17 @@ def _full_json_records(stream: BinaryIO, format: str) -> Iterator[dict[str, Any]
         yield _skip(1, "JSON document exceeds maximum size")
         return
     try:
-        value = json.loads(data.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
+        decoded = data.decode("utf-8")
+    except UnicodeDecodeError:
         yield _skip(1, "invalid JSON document")
+        return
+    try:
+        value = json.loads(decoded)
+    except json.JSONDecodeError:
+        yield _skip(1, "invalid JSON document")
+        return
+    except ValueError:
+        yield _skip(1, "unsupported JSON document")
         return
     except RecursionError:
         yield _skip(1, "deeply nested JSON")
@@ -617,43 +645,58 @@ def _metadata_update(result: dict[str, str], obj: Any, depth: int = 0) -> None:
             _metadata_update(result, value, depth + 1)
 
 
+def _recover_scalar_metadata(data: bytes, result: dict[str, str]) -> None:
+    """Recover simple scalar fields when a bounded JSON snapshot is partial."""
+    try:
+        text = data.decode("utf-8", errors="ignore")
+        patterns = {
+            "session_id": ("sessionId", "session_id"),
+            "cwd": ("cwd", "workingDirectory", "projectPath"),
+            "tool_version": ("version", "tool_version", "cliVersion"),
+            "started_at": ("timestamp", "startTime", "startedAt", "createdAt"),
+        }
+        for target, keys in patterns.items():
+            if target in result:
+                continue
+            for key in keys:
+                match = re.search(r'"' + re.escape(key) + r'"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', text)
+                if match:
+                    try:
+                        result[target] = json.loads('"' + match.group(1) + '"')
+                    except json.JSONDecodeError:
+                        result[target] = match.group(1)
+                    break
+    except (UnicodeError, RecursionError):
+        pass
+
+
 def metadata_from_bytes(data: bytes, format: str) -> dict[str, str]:
     """Best-effort metadata extraction from a bounded in-memory snapshot."""
     if not isinstance(data, bytes) or len(data) > MAX_JSON_BYTES:
         return {}
     result: dict[str, str] = {}
+    if format in {"claude-jsonl", "grok-acp-jsonl", "generic-jsonl", "codex-jsonl"}:
+        for line in data.splitlines()[:32]:
+            try:
+                decoded = line.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            try:
+                value = json.loads(decoded)
+            except (json.JSONDecodeError, ValueError, RecursionError):
+                continue
+            _metadata_update(result, value)
+        return result
+    if format not in {"gemini-json", "opencode-json", "common-json"}:
+        return result
     try:
-        if format in {"claude-jsonl", "grok-acp-jsonl", "generic-jsonl", "codex-jsonl"}:
-            for line in data.splitlines()[:32]:
-                try:
-                    _metadata_update(result, json.loads(line.decode("utf-8")))
-                except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
-                    continue
-        elif format in {"gemini-json", "opencode-json", "common-json"}:
-            _metadata_update(result, json.loads(data.decode("utf-8")))
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        decoded = data.decode("utf-8")
+        value = json.loads(decoded)
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
         # Bundle snapshots provide only a bounded prefix. Recover simple
         # scalar metadata that appears before the prefix was cut, without
         # treating arbitrary transcript text as structured data.
-        try:
-            text = data.decode("utf-8", errors="ignore")
-            patterns = {
-                "session_id": ("sessionId", "session_id"),
-                "cwd": ("cwd", "workingDirectory", "projectPath"),
-                "tool_version": ("version", "tool_version", "cliVersion"),
-                "started_at": ("timestamp", "startTime", "startedAt", "createdAt"),
-            }
-            for target, keys in patterns.items():
-                if target in result:
-                    continue
-                for key in keys:
-                    match = re.search(r'"' + re.escape(key) + r'"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', text)
-                    if match:
-                        try:
-                            result[target] = json.loads('"' + match.group(1) + '"')
-                        except json.JSONDecodeError:
-                            result[target] = match.group(1)
-                        break
-        except (UnicodeError, RecursionError):
-            pass
+        _recover_scalar_metadata(data, result)
+        return result
+    _metadata_update(result, value)
     return result

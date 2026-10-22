@@ -213,6 +213,37 @@ class CLITests(unittest.TestCase):
         self.assertIn('projects/work/session.jsonl', output.getvalue())
         self.assertIn('4.0 KiB', output.getvalue())
 
+    def test_human_search_identifies_codex_source_file(self):
+        self.run_cli('archive', '--execute')
+        result = subprocess.run(
+            [sys.executable, str(ROOT / 'bin/sessioncrate'), '--vault', str(self.vault),
+             'search', 'payment.retry()'],
+            cwd=self.base, capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(self.source.relative_to(self.home).as_posix(), result.stdout)
+        self.assertIn('line 2', result.stdout)
+
+    def test_human_search_and_show_identify_bundle_members(self):
+        from codex_vault import bundles
+        home = self.base / 'grok fixture'
+        group = home / 'sessions/project/session'
+        group.mkdir(parents=True)
+        paths = [group / 'first.txt', group / 'second.txt']
+        for path in paths:
+            path.write_text('shared search marker\n')
+        bundles.archive('grok', home, self.vault, older_than_days=0, execute=True)
+        archive_id = bundles.list_archives(self.vault)[0]['archive_id']
+        for args in [('search', 'shared search marker'), ('show', archive_id)]:
+            with self.subTest(command=args[0]):
+                result = subprocess.run(
+                    [sys.executable, str(ROOT / 'bin/sessioncrate'), '--vault', str(self.vault), *args],
+                    cwd=self.base, capture_output=True, text=True, timeout=30,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                for path in paths:
+                    self.assertIn(path.relative_to(home).as_posix(), result.stdout)
+
     @unittest.skipUnless(shutil.which('lsof'), 'lsof is unavailable')
     def test_prune_cli_skips_open_source_then_reclaims_after_it_closes(self):
         self.run_cli('archive', '--execute')

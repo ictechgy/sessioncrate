@@ -41,6 +41,7 @@ sessioncrate scan --tool codex --older-than 30
 sessioncrate archive --tool codex --older-than 30
 sessioncrate archive --tool codex --older-than 30 --execute
 sessioncrate stats --json
+sessioncrate stats --tool claude --json  # only Claude archives and their retained originals
 ```
 
 Keeping the originals adds archive storage; space is reclaimed only after verified originals are removed. `stats` counts the archives, metadata, and retained originals. Preview cleanup, then opt in explicitly:
@@ -51,6 +52,8 @@ sessioncrate prune --tool codex --execute
 ```
 
 `archive --execute --remove-originals` combines those operations. Originals are removed only after the integrity, source, and activity checks pass. Selected recent, changed, open, unsafe, or unverifiable originals are preserved. Other sessions may remain running; `lsof` checks open file descriptors, not an application's logical session state. Do not reopen the selected session during cleanup. See [compatibility and evidence](docs/compatibility.md) for native resume limits and [release preparation](docs/release.md) for the alpha boundary.
+
+For grouped sessions, age checks include every selected file and directory, including empty companion directories. For bundle adapters such as Claude, `stats --tool TOOL` counts the selected manifests, their unique referenced blobs, and their retained originals; unfiltered `stats` includes all archive blobs, including unreferenced blobs. A blob shared across tool labels is counted once in each relevant tool view and once in the overall view.
 
 ## Supported sources
 

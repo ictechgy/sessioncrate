@@ -35,6 +35,19 @@ class BundleTests(unittest.TestCase):
     def _discover(self, tool: str, source_root: Path) -> list[SimpleNamespace]:
         return [group for group in self._groups if group.tool == tool and group.source_root == source_root]
 
+    def _age_selected_directories(self, root_entries: tuple[str, ...], mtime_ns: int) -> None:
+        """Age only directory roots owned by a synthetic source group."""
+
+        for relative in root_entries:
+            root = self.source / relative
+            if root.is_symlink() or not root.is_dir():
+                continue
+            for current, _directories, _files in os.walk(root, followlinks=False):
+                path = Path(current)
+                if path.is_symlink():
+                    continue
+                os.utime(path, ns=(mtime_ns, mtime_ns))
+
     def _group(
         self,
         tool: str,
@@ -64,6 +77,7 @@ class BundleTests(unittest.TestCase):
             notes=(),
         )
         self._groups.append(group)
+        self._age_selected_directories(group.root_entries, old)
         return group
 
     def _replace_manifest(self, manifest: dict[str, object]) -> dict[str, object]:
@@ -480,6 +494,113 @@ class BundleTests(unittest.TestCase):
         self.assertTrue(empty.is_dir())
         self.assertEqual(stat.S_IMODE(empty.stat().st_mode), 0o750)
 
+    def test_fresh_empty_claude_companion_blocks_prune_until_aged(self) -> None:
+        files = {
+            "projects/demo/session-fresh.jsonl": b"main\n",
+            "projects/demo/session-fresh/worker.txt": b"worker\n",
+        }
+        self._group(
+            "claude",
+            "session-fresh",
+            files,
+            formats={path: "text" for path in files},
+            root_entries=("projects/demo/session-fresh.jsonl", "projects/demo/session-fresh"),
+        )
+        empty = self.source / "projects/demo/session-fresh/empty-companion"
+        empty.mkdir()
+        old = time.time_ns() - 2 * 86_400 * 1_000_000_000
+        fresh = time.time_ns() - bundles._HOUR_NS // 2
+        os.utime(empty, ns=(fresh, fresh))
+        os.utime(empty.parent, ns=(old, old))
+
+        scanned = bundles.scan("claude", self.source, older_than_days=1)
+        self.assertFalse(scanned["candidates"][0]["eligible"])
+        self.assertEqual(scanned["candidates"][0]["reason"], "too_new")
+
+        inactive = {"state": "inactive", "reason": "synthetic inactive"}
+        with mock.patch.object(bundles.activity, "probe_session_tree", return_value=inactive), mock.patch.object(
+            bundles.activity, "probe_session_file", return_value=inactive
+        ):
+            archived = bundles.archive(
+                "claude",
+                self.source,
+                self.vault,
+                older_than_days=0,
+                execute=True,
+                remove_originals=True,
+            )
+        manifest = archived["archived"][0]
+        self.assertEqual(archived["removed"], [])
+        self.assertTrue(empty.is_dir())
+
+        with mock.patch.object(bundles.activity, "probe_session_tree", return_value=inactive), mock.patch.object(
+            bundles.activity, "probe_session_file", return_value=inactive
+        ):
+            preview = bundles.prune(self.vault, manifest["archive_id"], execute=False)
+            executed = bundles.prune(self.vault, manifest["archive_id"], execute=True)
+        self.assertFalse(preview["candidates"][0]["eligible"])
+        self.assertIn("less than one hour", preview["candidates"][0]["reason"])
+        self.assertEqual(executed["removed"], [])
+        self.assertTrue(empty.is_dir())
+
+        with mock.patch.object(bundles.time, "time_ns", return_value=fresh + bundles._HOUR_NS + 1), mock.patch.object(
+            bundles.activity, "probe_session_tree", return_value=inactive
+        ), mock.patch.object(bundles.activity, "probe_session_file", return_value=inactive):
+            aged = bundles.prune(self.vault, manifest["archive_id"], execute=True)
+        self.assertEqual(aged["removed"], [manifest["archive_id"]])
+        self.assertFalse((self.source / "projects/demo/session-fresh.jsonl").exists())
+        self.assertFalse((self.source / "projects/demo/session-fresh").exists())
+
+    def test_fresh_nested_grok_directory_blocks_prune_until_aged(self) -> None:
+        files = {"sessions/cwd/session-fresh/updates.jsonl": b"updates\n"}
+        self._group(
+            "grok",
+            "session-fresh",
+            files,
+            formats={path: "text" for path in files},
+            root_entries=("sessions/cwd/session-fresh",),
+        )
+        nested = self.source / "sessions/cwd/session-fresh/tool-results/empty"
+        nested.mkdir(parents=True)
+        old = time.time_ns() - 2 * 86_400 * 1_000_000_000
+        fresh = time.time_ns() - bundles._HOUR_NS // 2
+        os.utime(nested, ns=(fresh, fresh))
+        os.utime(nested.parent, ns=(old, old))
+        os.utime(nested.parent.parent, ns=(old, old))
+
+        inactive = {"state": "inactive", "reason": "synthetic inactive"}
+        with mock.patch.object(bundles.activity, "probe_session_tree", return_value=inactive), mock.patch.object(
+            bundles.activity, "probe_session_file", return_value=inactive
+        ):
+            archived = bundles.archive(
+                "grok",
+                self.source,
+                self.vault,
+                older_than_days=0,
+                execute=True,
+                remove_originals=True,
+            )
+        manifest = archived["archived"][0]
+        self.assertEqual(archived["removed"], [])
+        self.assertTrue(nested.is_dir())
+
+        with mock.patch.object(bundles.activity, "probe_session_tree", return_value=inactive), mock.patch.object(
+            bundles.activity, "probe_session_file", return_value=inactive
+        ):
+            preview = bundles.prune(self.vault, manifest["archive_id"], execute=False)
+            executed = bundles.prune(self.vault, manifest["archive_id"], execute=True)
+        self.assertFalse(preview["candidates"][0]["eligible"])
+        self.assertIn("less than one hour", preview["candidates"][0]["reason"])
+        self.assertEqual(executed["removed"], [])
+        self.assertTrue(nested.is_dir())
+
+        with mock.patch.object(bundles.time, "time_ns", return_value=fresh + bundles._HOUR_NS + 1), mock.patch.object(
+            bundles.activity, "probe_session_tree", return_value=inactive
+        ), mock.patch.object(bundles.activity, "probe_session_file", return_value=inactive):
+            aged = bundles.prune(self.vault, manifest["archive_id"], execute=True)
+        self.assertEqual(aged["removed"], [manifest["archive_id"]])
+        self.assertFalse((self.source / "sessions/cwd/session-fresh").exists())
+
     def test_prune_rechecks_all_quarantined_identities_before_first_unlink(self) -> None:
         files = {
             "projects/demo/session-k.jsonl": b"main\n",
@@ -533,7 +654,9 @@ class BundleTests(unittest.TestCase):
             nonlocal calls
             calls += 1
             result = real_capture(root, group, file_paths)
-            if calls == 2:
+            # Candidate eligibility now captures directory metadata before
+            # the archive snapshot, so the snapshot's final walk is call 3.
+            if calls == 3:
                 (self.source / "sessions/cwd/session-l/a.txt").write_bytes(b"changed late\n")
             return result
 
@@ -1116,6 +1239,7 @@ class BundleRealAdapterTests(unittest.TestCase):
             valid.write_bytes(b'{"update":{"text":"searchable"}}\n')
             old = time.time_ns() - 2 * 86_400 * 1_000_000_000
             os.utime(valid, ns=(old, old))
+            os.utime(valid.parent, ns=(old, old))
             vault = root / "vault"
 
             scanned = bundles.scan("grok", source, older_than_days=1)

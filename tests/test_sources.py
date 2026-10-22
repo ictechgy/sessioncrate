@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,6 +17,21 @@ from codex_vault.sources import (
     valid_relative,
 )
 from codex_vault.storage import VaultError
+
+
+def _supports_large_integer_limit_test():
+    getter = getattr(sys, "get_int_max_str_digits", None)
+    if getter is None:
+        return False
+    try:
+        limit = getter()
+    except (AttributeError, ValueError):
+        return False
+    return isinstance(limit, int) and 0 < limit <= 5000
+
+
+def _large_integer_digits():
+    return max(5000, sys.get_int_max_str_digits() + 1)
 
 
 class SourceAdapterTests(unittest.TestCase):
@@ -267,6 +283,89 @@ class SourceAdapterTests(unittest.TestCase):
         self.assertTrue(any("tool state output" in record["text"] for record in state if "text" in record))
         chat_list = list(iter_text_records(io.BytesIO(json.dumps([{"role": "user", "content": "list chat"}]).encode()), "common-json"))
         self.assertEqual(chat_list[0]["text"], "list chat")
+
+    def test_grok_skips_private_updates_in_string_and_object_shapes(self):
+        lines = [
+            {"update": {"sessionUpdate": "agent_thought_chunk", "content": {"text": "private string thought"}}},
+            {"update": {"sessionUpdate": "hook_execution", "content": {"text": "private string hook"}}},
+            {"update": {"sessionUpdate": {"kind": "agent_thought_chunk", "content": {"text": "private object thought"}}}},
+            {"update": {"sessionUpdate": {"kind": "hook_execution", "content": {"text": "private object hook"}}}},
+            {"update": {"sessionUpdate": "user_message_chunk", "content": {"text": "visible user"}}},
+        ]
+        data = b"\n".join(json.dumps(line).encode() for line in lines) + b"\n"
+
+        records = list(iter_text_records(io.BytesIO(data), "grok-acp-jsonl"))
+        texts = [record["text"] for record in records if "text" in record]
+
+        self.assertEqual(texts, ["visible user"])
+        self.assertEqual(sum(record.get("reason") == "no readable text" for record in records), 4)
+
+    @unittest.skipUnless(_supports_large_integer_limit_test(), "interpreter has no bounded integer conversion limit")
+    def test_jsonl_large_integer_skips_record_and_continues(self):
+        digits = _large_integer_digits()
+        data = b"\n".join([
+            b'{"content":"before"}',
+            b'{"value":' + b"9" * digits + b'}',
+            b'{"content":"after"}',
+        ]) + b"\n"
+
+        records = list(iter_text_records(io.BytesIO(data), "generic-jsonl"))
+        self.assertEqual([record["text"] for record in records if "text" in record], ["before", "after"])
+        self.assertEqual(records[1], {"line": 2, "skipped": True, "reason": "unsupported JSON record"})
+
+    @unittest.skipUnless(_supports_large_integer_limit_test(), "interpreter has no bounded integer conversion limit")
+    def test_full_json_large_integer_is_skipped(self):
+        data = b'{"messages":[{"content":"before"},{"value":' + b"9" * _large_integer_digits() + b'}]}'
+
+        records = list(iter_text_records(io.BytesIO(data), "common-json"))
+        self.assertEqual(records, [{"line": 1, "skipped": True, "reason": "unsupported JSON document"}])
+
+    @unittest.skipUnless(_supports_large_integer_limit_test(), "interpreter has no bounded integer conversion limit")
+    def test_metadata_skips_large_integer_and_reads_later_jsonl_metadata(self):
+        digits = _large_integer_digits()
+        data = b"\n".join([
+            b'{"value":' + b"9" * digits + b'}',
+            b'{"sessionId":"after-large-int","cwd":"/repo"}',
+        ]) + b"\n"
+
+        self.assertEqual(
+            metadata_from_bytes(data, "generic-jsonl"),
+            {"session_id": "after-large-int", "cwd": "/repo"},
+        )
+        full_data = b'{"sessionId":"before-large-int","value":' + b"9" * digits + b'}'
+        self.assertEqual(
+            metadata_from_bytes(full_data, "common-json"),
+            {"session_id": "before-large-int"},
+        )
+
+    def test_injected_json_decoder_value_error_is_skipped_portably(self):
+        real_loads = json.loads
+
+        def loads(value):
+            if '"unsupported"' in value:
+                raise ValueError("injected decoder failure")
+            return real_loads(value)
+
+        with mock.patch("codex_vault.sources.json.loads", side_effect=loads):
+            jsonl = list(iter_text_records(io.BytesIO(
+                b'{"content":"before"}\n{"unsupported":true}\n{"content":"after"}\n'
+            ), "generic-jsonl"))
+            self.assertEqual([record["text"] for record in jsonl if "text" in record], ["before", "after"])
+            self.assertEqual(jsonl[1]["reason"], "unsupported JSON record")
+
+            full = list(iter_text_records(io.BytesIO(b'{"unsupported":true}'), "common-json"))
+            self.assertEqual(full, [{"line": 1, "skipped": True, "reason": "unsupported JSON document"}])
+
+            metadata = metadata_from_bytes(
+                b'{"unsupported":true}\n{"sessionId":"after-injected-error"}\n',
+                "generic-jsonl",
+            )
+            self.assertEqual(metadata, {"session_id": "after-injected-error"})
+
+    def test_unrelated_record_processing_value_error_is_not_suppressed(self):
+        with mock.patch("codex_vault.sources._record_text", side_effect=ValueError("unrelated record failure")):
+            with self.assertRaisesRegex(ValueError, "unrelated record failure"):
+                list(iter_text_records(io.BytesIO(b'{"content":"text"}\n'), "generic-jsonl"))
 
     def test_gemini_tool_call_results_are_searchable_and_images_are_skipped(self):
         sample = {

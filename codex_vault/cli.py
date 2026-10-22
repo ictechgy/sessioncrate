@@ -14,7 +14,7 @@ def _options(parser, *, subcommand=False):
     parser.add_argument('--source-root', type=Path, default=fallback,
                         help='Selected tool home, or a directory containing explicit session exports')
     parser.add_argument('--tool', choices=('codex', 'claude', 'grok', 'gemini', 'agy', 'glm', 'opencode', 'export', 'all'),
-                        default=fallback, help='Source tool; scan/archive default codex, list/search default all')
+                        default=fallback, help='Source tool; scan/archive default codex, list/search/stats/verify default all')
     parser.add_argument('--vault', type=Path, default=fallback,
                         help='Private archive directory (default: ~/.local/share/codex-vault)')
     parser.add_argument('--json', action='store_true', default=fallback,
@@ -76,7 +76,7 @@ def parser(program_name=None):
     commands['verify'].add_argument('archive_id', nargs='?')
     commands['restore'].add_argument('archive_id')
     commands['restore'].add_argument('--destination-home', type=Path,
-                                     help='Restore below a separate Codex home, instead of the original location')
+                                     help='Restore below a separate source directory, instead of the original location')
     commands['restore'].add_argument('--execute', action='store_true', help='Write restored files; otherwise preview only')
     return root
 
@@ -107,6 +107,9 @@ def _print_human(result):
     if 'matches' in result:
         for hit in result['matches']:
             print(f"[{_clean(hit.get('tool', 'codex'))}] {hit['archive_id'][:12]}  {_clean(hit.get('cwd', ''))}  line {hit['line']}  {_clean(hit['kind'])}")
+            source = hit.get('member_path') or hit.get('relative_path')
+            if source:
+                print(f"  source: {_clean(source)}")
             print(f"  {_clean(hit['snippet'])}")
         print(f"{len(result['matches'])} match(es), {result.get('scanned_archives', 0)} archive(s) scanned")
         if result.get('truncated'):
@@ -125,6 +128,8 @@ def _print_human(result):
     if 'records' in result:
         for record in result['records']:
             print(f"[{record.get('line', '?')}] {_clean(record.get('kind', ''))}")
+            if record.get('member_path'):
+                print(f"  source: {_clean(record['member_path'])}")
             print(_clean(record.get('text', '')))
     for key, value in result.items():
         if key in ('archives', 'matches', 'records'):
@@ -250,8 +255,10 @@ def _run(args, vault):
         for name, backend in (('codex', storage), ('bundles', bundles)):
             if selected == 'codex' and name == 'bundles':
                 continue
+            if selected not in (None, 'codex') and name == 'codex':
+                continue
             try:
-                costs = backend.stats(vault)
+                costs = backend.stats(vault, tool=selected) if name == 'bundles' else backend.stats(vault)
             except (storage.VaultError, OSError) as error:
                 errors.append({'namespace': name, 'error': str(error)})
                 continue

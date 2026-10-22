@@ -94,6 +94,72 @@ class MultiToolCLITests(unittest.TestCase):
         self.assertEqual(costs['source_bytes_retained'], retained)
         self.assertEqual(costs['net_storage_bytes'], costs['vault_bytes'] + retained)
 
+    def test_stats_tool_scope_counts_only_selected_archives_and_unique_blobs(self):
+        from tests.helpers import make_codex_home, make_session
+        home = make_codex_home(self.base)
+        codex = make_session(home, age_seconds=60 * 86400)
+        self.run_cli('archive', '--source-root', str(home), '--execute')
+        sources = []
+        for label, tool, text in [('one', 'export', 'shared export bytes\n'),
+                                  ('two', 'export', 'shared export bytes\n'),
+                                  ('three', 'glm', 'different GLM export\n')]:
+            root = self.base / label
+            root.mkdir()
+            path = root / 'session.txt'
+            path.write_text(text)
+            stamp = 1_700_000_000_000_000_000
+            os.utime(path, ns=(stamp, stamp))
+            self.run_cli('archive', '--tool', tool, '--source-root', str(root), '--execute')
+            sources.append(path)
+        archives = json.loads(self.run_cli('list').stdout)['archives']
+        orphan = self.vault / 'bundles/blobs' / ('f' * 64 + '.tar.gz')
+        orphan.write_bytes(b'unreferenced synthetic blob')
+        self.assertEqual(json.loads(self.run_cli('stats').stdout)['archive_count'], 4)
+        for tool, count, retained in [('codex', 1, codex.stat().st_size),
+                                     ('export', 2, sum(path.stat().st_size for path in sources[:2])),
+                                     ('glm', 1, sources[2].stat().st_size)]:
+            with self.subTest(tool=tool):
+                selected = [item for item in archives if item['tool'] == tool]
+                costs = json.loads(self.run_cli('stats', '--tool', tool).stdout)
+                manifest_dir = self.vault / ('manifests' if tool == 'codex' else 'bundles/manifests')
+                manifest_bytes = sum((manifest_dir / (item['archive_id'] + '.json')).stat().st_size
+                                     for item in selected)
+                blobs = {item['blob'] for item in selected}
+                blob_bytes = sum((self.vault / path).stat().st_size for path in blobs)
+                self.assertEqual(costs['archive_count'], count)
+                self.assertEqual(costs['blob_count'], 1)
+                self.assertEqual(costs['raw_bytes'], sum(item['raw_bytes'] for item in selected))
+                self.assertEqual(costs['manifest_bytes'], manifest_bytes)
+                self.assertEqual(costs['vault_bytes'], manifest_bytes + blob_bytes)
+                self.assertEqual(costs['source_bytes_retained'], retained)
+                self.assertEqual(costs['net_storage_bytes'], manifest_bytes + blob_bytes + retained)
+        # A different namespace must not make a scoped result partial.
+        (self.vault / 'manifests' / ('0' * 64 + '.json')).write_text('{}')
+        costs = json.loads(self.run_cli('stats', '--tool', 'export').stdout)
+        self.assertFalse(costs['partial'])
+        self.assertEqual(costs['codex'], {})
+        empty = json.loads(self.run_cli('stats', '--tool', 'claude').stdout)
+        self.assertEqual(empty['archive_count'], 0)
+        self.assertEqual(empty['vault_bytes'], 0)
+
+    def test_unreadable_numeric_export_roundtrips_and_search_continues(self):
+        root = self.base / 'numeric export'
+        root.mkdir()
+        source = root / 'session.jsonl'
+        raw = (b'{"value":' + b'9' * 5000 + b'}\n'
+               b'{"content":"searchable after numeric record"}\n')
+        source.write_bytes(raw)
+        age_tree(root)
+        self.run_cli('archive', '--tool', 'export', '--source-root', str(root), '--execute')
+        source.unlink()  # Only this disposable fixture; prove archive independence.
+        result = json.loads(self.run_cli('search', 'searchable after', '--tool', 'export').stdout)
+        self.assertEqual(len(result['matches']), 1)
+        self.assertEqual(result['skipped_records'], 1)
+        archive_id = result['matches'][0]['archive_id']
+        self.run_cli('verify', archive_id)
+        self.run_cli('restore', archive_id, '--execute')
+        self.assertEqual(source.read_bytes(), raw)
+
     def test_grok_native_and_glm_agy_exports_are_searchable(self):
         grok = self.base / 'grok source'
         updates = grok / 'sessions/%2Fwork/grok-one/updates.jsonl'

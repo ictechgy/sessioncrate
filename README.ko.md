@@ -41,6 +41,7 @@ sessioncrate scan --tool codex --older-than 30
 sessioncrate archive --tool codex --older-than 30
 sessioncrate archive --tool codex --older-than 30 --execute
 sessioncrate stats --json
+sessioncrate stats --tool claude --json  # Claude 아카이브와 남아 있는 원본만 집계
 ```
 
 원본을 유지하면 압축본만큼 저장 공간이 추가됩니다. 공간 회수는 검증된 원본을 제거한 뒤 발생하며, `stats`는 압축본·메타데이터·남아 있는 원본의 용량을 함께 계산합니다. 정리할 대상을 다시 미리 보고 명시적으로 실행하세요.
@@ -51,6 +52,8 @@ sessioncrate prune --tool codex --execute
 ```
 
 `archive --execute --remove-originals`로 보관과 원본 정리를 함께 실행할 수도 있습니다. 이 경우에도 변경되지 않았고 검증된 원본만 확인한 뒤 제거합니다. 최근 파일, 내용이 바뀐 파일, 사용 중인 파일, 안전성을 확인할 수 없는 파일은 보존합니다. 다른 세션은 계속 실행해도 되지만, 정리 대상 세션 자체는 작업 중 다시 열지 마세요. `lsof`는 열린 파일 핸들을 확인할 뿐 애플리케이션의 논리적 세션 상태를 확인하지 않습니다. native resume의 한계는 [지원 범위와 검증 근거](docs/compatibility.md)를 참고하세요.
+
+묶음 세션의 경과 시간은 빈 동반 폴더를 포함한 모든 선택 파일·폴더의 수정 시각으로 판단합니다. Claude 등 묶음 어댑터의 `stats --tool TOOL`은 선택한 메타데이터, 해당 메타데이터가 참조하는 중복 없는 압축본, 남아 있는 원본을 집계합니다. 필터 없는 `stats`는 참조가 없는 압축본까지 포함합니다. 여러 도구 라벨이 공유하는 압축본은 각 도구별 조회에 한 번씩, 전체 조회에는 한 번만 집계됩니다.
 
 ## 지원하는 도구
 

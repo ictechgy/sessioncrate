@@ -786,8 +786,11 @@ def _group_candidates(tool: str, source_root: Path, older_than_days: int) -> lis
                 })
                 continue
             stats = [storage._safe_regular(root.joinpath(*PurePosixPath(value).parts), label="bundle source file") for value in files]
-            newest = max(stat_item.st_mtime_ns for stat_item in stats)
-            eligible = bool(group.removable) and newest <= cutoff and all(stat_item.st_mtime_ns <= cutoff for stat_item in stats)
+            directories = _capture_directories(root, group, set(files))
+            directory_mtimes = [int(item["mtime_ns"]) for item in directories]
+            member_mtimes = [stat_item.st_mtime_ns for stat_item in stats] + directory_mtimes
+            newest = max(member_mtimes)
+            eligible = bool(group.removable) and newest <= cutoff and all(item <= cutoff for item in member_mtimes)
             reason = "eligible" if eligible else ("too_new" if newest > cutoff else "; ".join(group.notes) or "not_removable")
             result.append({
                 "tool": group.tool,
@@ -1360,6 +1363,10 @@ def _verify_current_source(
             or current.st_mtime_ns != item["mtime_ns"]
         ):
             raise VaultError(f"source changed since archive: {item['path']}")
+        # Directory mtimes are part of the source group's snapshot. Keep them
+        # in the same age barrier as files so a newly-created empty or nested
+        # companion cannot be pruned immediately after archiving.
+        current_stats.append(current)
     return root, _group_root_paths(root, manifest), current_stats
 
 
@@ -1842,7 +1849,7 @@ def show(vault_dir: Path, archive_id: str, limit: int = 100, query: str | None =
     return {"archive_id": manifest["archive_id"], "records": records, "skipped_records": skipped, "truncated": matching_records > limit}
 
 
-def stats(vault_dir: Path) -> dict[str, Any]:
+def stats(vault_dir: Path, tool: str | None = None) -> dict[str, Any]:
     empty = {
         "bundle_archives": 0,
         "bundle_blobs": 0,
@@ -1861,15 +1868,22 @@ def stats(vault_dir: Path) -> dict[str, Any]:
         bundle_root = _bundle_root(vault, create=False)
         if bundle_root is None:
             return empty
-        manifests = list(_iter_manifests(bundle_root))
-        manifest_stats = [path.stat() for path in _iter_manifest_paths(bundle_root)]
+        manifests = [item for item in _iter_manifests(bundle_root) if tool is None or item['tool'] == tool]
+        manifest_stats = [storage._safe_regular(_manifest_path(bundle_root, item['archive_id']),
+                                               label="bundle manifest") for item in manifests]
         blob_stats: list[os.stat_result] = []
-        for entry in os.scandir(bundle_root / "blobs"):
-            if not entry.name.endswith(".tar.gz"):
-                continue
-            entry_stat = entry.stat(follow_symlinks=False)
-            if stat.S_ISREG(entry_stat.st_mode) and not stat.S_ISLNK(entry_stat.st_mode):
-                blob_stats.append(entry_stat)
+        if tool is not None:
+            # Shared blobs count once per selected view. Unreferenced blobs
+            # belong only to the unfiltered storage total.
+            for relative in sorted({item['blob'] for item in manifests}):
+                blob_stats.append(storage._safe_regular(vault / relative, label="bundle blob"))
+        else:
+            for entry in os.scandir(bundle_root / "blobs"):
+                if not entry.name.endswith(".tar.gz"):
+                    continue
+                entry_stat = entry.stat(follow_symlinks=False)
+                if stat.S_ISREG(entry_stat.st_mode) and not stat.S_ISLNK(entry_stat.st_mode):
+                    blob_stats.append(entry_stat)
         manifest_bytes = sum(item.st_size for item in manifest_stats)
         blob_bytes = sum(item.st_size for item in blob_stats)
         vault_bytes = manifest_bytes + blob_bytes

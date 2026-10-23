@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import errno
 import gzip
+import io
 import json
 import os
 import shutil
@@ -13,6 +15,13 @@ from unittest import mock
 
 from codex_vault import storage
 from tests.helpers import make_codex_home, make_session, write_session_bytes
+
+
+def _gzip_bytes(payload: bytes) -> bytes:
+    output = io.BytesIO()
+    with gzip.GzipFile(fileobj=output, mode="wb", compresslevel=9, mtime=0) as stream:
+        stream.write(payload)
+    return output.getvalue()
 
 
 class StorageTests(unittest.TestCase):
@@ -184,6 +193,128 @@ class StorageTests(unittest.TestCase):
 
         self.assertEqual(source.read_bytes(), original)
 
+    def test_reader_rejects_same_size_blob_replacement_after_preverification(self) -> None:
+        home = make_codex_home(self.tmp_path)
+        source = make_session(home)
+        vault = self.tmp_path / "vault"
+        storage.archive(home, vault, older_than_days=1, execute=True)
+        manifest = self._manifest(vault)
+        blob = vault / manifest["blob"]
+        original = source.read_bytes()
+        replacement_payload = original.replace(b"session-synthetic", b"session-synthetix")
+        replacement_bytes = _gzip_bytes(replacement_payload)
+        replacement = self.tmp_path / "replacement.jsonl.gz"
+        replacement.write_bytes(replacement_bytes)
+        self.assertEqual(len(replacement_payload), manifest["raw_bytes"])
+        self.assertEqual(replacement.stat().st_size, blob.stat().st_size)
+        real_verify = storage._verify_gzip
+
+        def replace_after_verify(*args, **kwargs):
+            result = real_verify(*args, **kwargs)
+            os.replace(replacement, blob)
+            return result
+
+        with mock.patch.object(storage, "_verify_gzip", side_effect=replace_after_verify):
+            with self.assertRaisesRegex(storage.VaultError, "changed while being read"):
+                list(storage.iter_archive_lines(vault, manifest))
+
+    def test_reader_rejects_symlink_replacement_after_preverification(self) -> None:
+        home = make_codex_home(self.tmp_path)
+        source = make_session(home)
+        vault = self.tmp_path / "vault"
+        storage.archive(home, vault, older_than_days=1, execute=True)
+        manifest = self._manifest(vault)
+        blob = vault / manifest["blob"]
+        replacement = self.tmp_path / "replacement.jsonl.gz"
+        replacement.write_bytes(blob.read_bytes())
+        real_verify = storage._verify_gzip
+
+        def replace_after_verify(*args, **kwargs):
+            result = real_verify(*args, **kwargs)
+            blob.unlink()
+            blob.symlink_to(replacement)
+            return result
+
+        with mock.patch.object(storage, "_verify_gzip", side_effect=replace_after_verify):
+            with self.assertRaisesRegex(storage.VaultError, "changed while being read"):
+                list(storage.iter_archive_lines(vault, manifest))
+
+        self.assertEqual(source.read_bytes(), gzip.decompress(replacement.read_bytes()))
+
+    def test_reader_rejects_in_place_mutation_after_preverification(self) -> None:
+        home = make_codex_home(self.tmp_path)
+        source = make_session(home)
+        vault = self.tmp_path / "vault"
+        storage.archive(home, vault, older_than_days=1, execute=True)
+        manifest = self._manifest(vault)
+        blob = vault / manifest["blob"]
+        original = source.read_bytes()
+        replacement_payload = original.replace(b"session-synthetic", b"session-synthetix")
+        replacement_bytes = _gzip_bytes(replacement_payload)
+        self.assertEqual(len(replacement_bytes), blob.stat().st_size)
+        real_verify = storage._verify_gzip
+
+        def mutate_after_verify(*args, **kwargs):
+            result = real_verify(*args, **kwargs)
+            with blob.open("r+b") as stream:
+                stream.write(replacement_bytes)
+                stream.flush()
+                os.fsync(stream.fileno())
+            return result
+
+        with mock.patch.object(storage, "_verify_gzip", side_effect=mutate_after_verify):
+            with self.assertRaisesRegex(storage.VaultError, "changed while being read"):
+                list(storage.iter_archive_lines(vault, manifest))
+
+    def test_reader_hashes_bytes_consumed_after_preverification(self) -> None:
+        home = make_codex_home(self.tmp_path)
+        source = make_session(home)
+        vault = self.tmp_path / "vault"
+        storage.archive(home, vault, older_than_days=1, execute=True)
+        manifest = self._manifest(vault)
+        blob = vault / manifest["blob"]
+        original = source.read_bytes()
+        replacement_payload = original.replace(b"session-synthetic", b"session-synthetix")
+        replacement_bytes = _gzip_bytes(replacement_payload)
+        self.assertEqual(len(replacement_bytes), blob.stat().st_size)
+        real_verify = storage._verify_gzip
+
+        def mutate_after_verify(*args, **kwargs):
+            result = real_verify(*args, **kwargs)
+            with blob.open("r+b") as stream:
+                stream.write(replacement_bytes)
+                stream.flush()
+                os.fsync(stream.fileno())
+            return result
+
+        with mock.patch.object(storage, "_verify_gzip", side_effect=mutate_after_verify):
+            with mock.patch.object(storage, "_require_unchanged_open_blob", return_value=None):
+                with self.assertRaisesRegex(storage.VaultError, "digest or size changed"):
+                    list(storage.iter_archive_lines(vault, manifest))
+
+    def test_reader_closes_anchored_blob_descriptor(self) -> None:
+        home = make_codex_home(self.tmp_path)
+        make_session(home)
+        vault = self.tmp_path / "vault"
+        storage.archive(home, vault, older_than_days=1, execute=True)
+        manifest = self._manifest(vault)
+        blob = vault / manifest["blob"]
+        real_open = storage._open_nofollow
+        opened: list[int] = []
+
+        def track_open(path: Path, flags: int) -> int:
+            fd = real_open(path, flags)
+            if path == blob:
+                opened.append(fd)
+            return fd
+
+        with mock.patch.object(storage, "_open_nofollow", side_effect=track_open):
+            self.assertTrue(list(storage.iter_archive_lines(vault, manifest)))
+
+        self.assertEqual(len(opened), 1)
+        with self.assertRaises(OSError):
+            os.fstat(opened[0])
+
     def test_restore_normalizes_invalid_deflate_without_publishing_destination(self) -> None:
         home = make_codex_home(self.tmp_path)
         source = make_session(home)
@@ -334,6 +465,31 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(list((vault / "blobs").glob(".vault-blob-*")), [])
         self.assertTrue(storage.verify(vault)["ok"])
 
+    def test_session_metadata_decoder_limits_do_not_abort_independent_candidates(self) -> None:
+        home = make_codex_home(self.tmp_path)
+        invalid = make_session(home, "sessions/a/rollout-limited.jsonl", session_id="synthetic-decoder-limit")
+        healthy = make_session(home, "sessions/z/rollout-healthy.jsonl")
+        original_loads = json.loads
+        for error_type in (ValueError, RecursionError):
+            with self.subTest(error=error_type.__name__):
+                vault = self.tmp_path / error_type.__name__
+
+                def limited_loads(value, **kwargs):
+                    if "synthetic-decoder-limit" in value:
+                        raise error_type("synthetic decoder detail must stay private")
+                    return original_loads(value, **kwargs)
+
+                with mock.patch.object(storage.json, "loads", side_effect=limited_loads):
+                    result = storage.archive(home, vault, older_than_days=1, execute=True)
+                self.assertEqual([item["relative_path"] for item in result["archived"]], [healthy.relative_to(home).as_posix()])
+                self.assertEqual(len(result["errors"]), 1)
+                self.assertIn("invalid JSON", result["errors"][0]["reason"])
+                self.assertNotIn("synthetic decoder detail", result["errors"][0]["reason"])
+                self.assertTrue(invalid.exists())
+                self.assertTrue(healthy.exists())
+                self.assertEqual(list((vault / "blobs").glob(".vault-blob-*")), [])
+                self.assertTrue(storage.verify(vault)["ok"])
+
     def test_restore_conflict_preserves_existing_destination(self) -> None:
         home = make_codex_home(self.tmp_path)
         make_session(home)
@@ -347,6 +503,70 @@ class StorageTests(unittest.TestCase):
         with self.assertRaises(storage.VaultError):
             storage.restore(vault, manifest["archive_id"], destination, execute=True)
         self.assertEqual(target.read_bytes(), b"different existing content")
+
+    def test_restore_preview_preflights_existing_destinations_without_writes(self) -> None:
+        home = make_codex_home(self.tmp_path)
+        source = make_session(home)
+        original = source.read_bytes()
+        vault = self.tmp_path / "vault"
+        storage.archive(home, vault, older_than_days=1, execute=True)
+        manifest = self._manifest(vault)
+
+        identical = storage.restore(vault, manifest["archive_id"], execute=False)
+        self.assertTrue(identical["skipped"])
+        self.assertFalse(identical["restored"])
+        self.assertEqual(source.read_bytes(), original)
+
+        target = self.tmp_path / "preview home" / manifest["relative_path"]
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"different existing content")
+        with self.assertRaisesRegex(storage.VaultError, "different bytes"):
+            storage.restore(vault, manifest["archive_id"], self.tmp_path / "preview home", execute=False)
+        self.assertEqual(target.read_bytes(), b"different existing content")
+
+        absent_root = self.tmp_path / "absent preview home"
+        preview = storage.restore(vault, manifest["archive_id"], absent_root, execute=False)
+        self.assertFalse(preview["skipped"])
+        self.assertFalse(absent_root.exists())
+
+    def test_restore_preview_rejects_unsafe_destination_without_following_it(self) -> None:
+        home = make_codex_home(self.tmp_path)
+        make_session(home)
+        vault = self.tmp_path / "vault"
+        storage.archive(home, vault, older_than_days=1, execute=True)
+        manifest = self._manifest(vault)
+        destination = self.tmp_path / "preview home"
+        target = destination / manifest["relative_path"]
+        target.parent.mkdir(parents=True)
+        sentinel = self.tmp_path / "preview sentinel"
+        sentinel.write_bytes(b"keep")
+        os.chmod(sentinel, 0o644)
+        target.symlink_to(sentinel)
+
+        with self.assertRaisesRegex(storage.VaultError, "unsafe non-regular|symlink path component"):
+            storage.restore(vault, manifest["archive_id"], destination, execute=False)
+
+        self.assertEqual(sentinel.read_bytes(), b"keep")
+        self.assertEqual(stat.S_IMODE(sentinel.stat().st_mode), 0o644)
+
+    def test_restore_preview_rejects_destination_replaced_while_hashing(self) -> None:
+        home = make_codex_home(self.tmp_path)
+        source = make_session(home)
+        vault = self.tmp_path / "vault"
+        storage.archive(home, vault, older_than_days=1, execute=True)
+        manifest = self._manifest(vault)
+        replacement = self.tmp_path / "preview replacement"
+        replacement.write_bytes(source.read_bytes())
+        real_hash_stream = storage._hash_stream
+
+        def replace_after_hash(stream):
+            result = real_hash_stream(stream)
+            os.replace(replacement, source)
+            return result
+
+        with mock.patch.object(storage, "_hash_stream", side_effect=replace_after_hash):
+            with self.assertRaisesRegex(storage.VaultError, "changed while being read"):
+                storage.restore(vault, manifest["archive_id"], execute=False)
 
     def test_restore_publishes_mode_zero_after_writing_temp(self) -> None:
         home = make_codex_home(self.tmp_path)
@@ -481,6 +701,81 @@ class StorageTests(unittest.TestCase):
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
             lock.close()
 
+    def test_lock_open_race_does_not_follow_symlink_or_chmod_target(self) -> None:
+        home = make_codex_home(self.tmp_path)
+        make_session(home)
+        vault = self.tmp_path / "vault"
+        storage.archive(home, vault, older_than_days=1, execute=True)
+        lock_path = vault / ".lock"
+        sentinel = self.tmp_path / "lock sentinel"
+        sentinel.write_bytes(b"keep")
+        os.chmod(sentinel, 0o644)
+        real_open = storage.os.open
+        raced = False
+
+        def race_open(path, flags, *args, **kwargs):
+            nonlocal raced
+            if Path(path) == lock_path and not raced:
+                raced = True
+                lock_path.unlink()
+                lock_path.symlink_to(sentinel)
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(storage.os, "open", side_effect=race_open):
+            with self.assertRaises(storage.VaultError):
+                storage.list_archives(vault)
+
+        self.assertTrue(raced)
+        self.assertTrue(lock_path.is_symlink())
+        self.assertEqual(stat.S_IMODE(sentinel.stat().st_mode), 0o644)
+
+    def test_lock_accepts_concurrently_created_regular_lock_without_chmod(self) -> None:
+        vault = self.tmp_path / "vault"
+        vault.mkdir()
+        lock_path = vault / ".lock"
+        real_open = storage.os.open
+        raced = False
+
+        def concurrent_create(path, flags, *args, **kwargs):
+            nonlocal raced
+            if Path(path) == lock_path and flags & os.O_EXCL and not raced:
+                raced = True
+                fd = real_open(lock_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o640)
+                os.close(fd)
+                os.chmod(lock_path, 0o640)
+                raise FileExistsError(errno.EEXIST, "concurrent lock creation")
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(storage.os, "open", side_effect=concurrent_create):
+            with storage._vault_lock(vault, exclusive=True, create=False) as locked:
+                self.assertEqual(locked, vault)
+
+        self.assertTrue(raced)
+        self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o640)
+
+    def test_lock_setup_failure_closes_new_descriptor(self) -> None:
+        vault = self.tmp_path / "vault"
+        vault.mkdir()
+        lock_path = vault / ".lock"
+        real_open = storage.os.open
+        opened: list[int] = []
+
+        def track_open(path, flags, *args, **kwargs):
+            fd = real_open(path, flags, *args, **kwargs)
+            if Path(path) == lock_path:
+                opened.append(fd)
+            return fd
+
+        with mock.patch.object(storage.os, "open", side_effect=track_open):
+            with mock.patch.object(storage.os, "fchmod", side_effect=OSError("chmod failed")):
+                with self.assertRaisesRegex(OSError, "chmod failed"):
+                    with storage._vault_lock(vault, exclusive=True, create=False):
+                        self.fail("lock body must not run")
+
+        self.assertEqual(len(opened), 1)
+        with self.assertRaises(OSError):
+            os.fstat(opened[0])
+
     def test_prune_preserves_active_source_and_stats_count_actual_bytes(self) -> None:
         home = make_codex_home(self.tmp_path)
         source = make_session(home, age_seconds=2 * 86400)
@@ -508,6 +803,38 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(stats["source_bytes_retained"], source.stat().st_size)
         self.assertEqual(stats["managed_bytes"], stats["vault_bytes"] + stats["source_bytes_retained"])
         self.assertEqual(stats["net_storage_bytes"], stats["managed_bytes"])
+
+    def test_stats_include_only_regular_unfinished_temps(self) -> None:
+        home = make_codex_home(self.tmp_path)
+        make_session(home, age_seconds=2 * 86400)
+        vault = self.tmp_path / "vault"
+        storage.archive(home, vault, older_than_days=1, execute=True)
+        baseline = storage.stats(vault)
+        blobs = vault / "blobs"
+        manifests = vault / "manifests"
+        blob_temp = blobs / ".vault-blob-incomplete.jsonl.gz"
+        manifest_temp = manifests / ".vault-tmp-incomplete.json"
+        blob_temp.write_bytes(b"blob temp")
+        manifest_temp.write_bytes(b"manifest temp")
+        outside = self.tmp_path / "outside"
+        outside.write_bytes(b"must not be counted")
+        (blobs / ".vault-blob-link").symlink_to(outside)
+        (manifests / ".vault-tmp-link").symlink_to(outside)
+
+        result = storage.stats(vault)
+
+        self.assertEqual(result["temporary_files"], 2)
+        self.assertEqual(result["temporary_bytes"], blob_temp.stat().st_size + manifest_temp.stat().st_size)
+        self.assertGreater(result["temporary_allocated_bytes"], 0)
+        self.assertEqual(result["blob_count"], 1)
+        self.assertEqual(result["archives"], baseline["archives"])
+        self.assertEqual(result["manifest_bytes"], baseline["manifest_bytes"])
+        self.assertEqual(result["blob_bytes"], baseline["blob_bytes"])
+        self.assertEqual(result["vault_bytes"] - baseline["vault_bytes"], result["temporary_bytes"])
+        self.assertEqual(result["allocated_bytes"] - baseline["allocated_bytes"], result["temporary_allocated_bytes"])
+        self.assertEqual(result["vault_bytes"], result["blob_bytes"] + result["manifest_bytes"] + result["temporary_bytes"])
+        self.assertEqual(result["managed_bytes"], result["vault_bytes"] + result["source_bytes_retained"])
+        self.assertTrue(outside.exists())
 
     def test_prune_inactive_session_while_unrelated_codex_runs(self) -> None:
         home = make_codex_home(self.tmp_path)
@@ -680,6 +1007,83 @@ class StorageTests(unittest.TestCase):
         with self.assertRaisesRegex(storage.VaultError, "missing required fields"):
             storage.resolve_archive(vault, manifest["archive_id"][:12])
 
+    def test_manifest_reader_rejects_oversized_file_before_decoding(self) -> None:
+        home = make_codex_home(self.tmp_path)
+        make_session(home)
+        vault = self.tmp_path / "vault"
+        storage.archive(home, vault, older_than_days=1, execute=True)
+        manifest = self._manifest(vault)
+        manifest_path = vault / "manifests" / f"{manifest['archive_id']}.json"
+        with manifest_path.open("r+b") as stream:
+            stream.truncate(storage._MAX_MANIFEST_BYTES + 1)
+
+        with self.assertRaisesRegex(storage.VaultError, "manifest exceeds maximum size"):
+            storage.resolve_archive(vault, manifest["archive_id"])
+
+    def test_manifest_reader_bounded_read_rejects_growth_after_stat(self) -> None:
+        home = make_codex_home(self.tmp_path)
+        make_session(home)
+        vault = self.tmp_path / "vault"
+        storage.archive(home, vault, older_than_days=1, execute=True)
+        manifest = self._manifest(vault)
+        manifest_path = vault / "manifests" / f"{manifest['archive_id']}.json"
+        real_fdopen = storage.os.fdopen
+        grown = False
+
+        def grow_before_read(fd: int, *args, **kwargs):
+            nonlocal grown
+            stream = real_fdopen(fd, *args, **kwargs)
+            if not grown:
+                grown = True
+                with manifest_path.open("r+b") as writer:
+                    writer.truncate(storage._MAX_MANIFEST_BYTES + 1)
+            return stream
+
+        with mock.patch.object(storage.os, "fdopen", side_effect=grow_before_read):
+            with self.assertRaisesRegex(storage.VaultError, "manifest exceeds maximum size"):
+                storage.resolve_archive(vault, manifest["archive_id"])
+        self.assertTrue(grown)
+
+    def test_manifest_reader_normalizes_pathological_json_errors(self) -> None:
+        home = make_codex_home(self.tmp_path)
+        make_session(home)
+        vault = self.tmp_path / "vault"
+        storage.archive(home, vault, older_than_days=1, execute=True)
+        manifest = self._manifest(vault)
+        manifest_path = vault / "manifests" / f"{manifest['archive_id']}.json"
+
+        pathological = (
+            b'{"raw_bytes":'
+            + b"9" * 5000
+            + b"}"
+        )
+        manifest_path.write_bytes(pathological)
+        with self.assertRaisesRegex(storage.VaultError, "manifest is invalid JSON") as integer_error:
+            storage.resolve_archive(vault, manifest["archive_id"])
+        self.assertNotIn("9999999999", str(integer_error.exception))
+
+        manifest_path.write_bytes(b"[" * 1_000_000 + b"]" * 1_000_000)
+        with self.assertRaisesRegex(storage.VaultError, "manifest is invalid JSON"):
+            storage.resolve_archive(vault, manifest["archive_id"])
+
+    def test_prune_malformed_manifest_fails_before_any_batch_deletion(self) -> None:
+        home = make_codex_home(self.tmp_path)
+        first = make_session(home, "sessions/a/rollout-first.jsonl")
+        second = make_session(home, "sessions/b/rollout-second.jsonl")
+        vault = self.tmp_path / "vault"
+        storage.archive(home, vault, older_than_days=1, execute=True)
+        manifests = storage.list_archives(vault)
+        malformed = vault / "manifests" / f"{manifests[-1]['archive_id']}.json"
+        malformed.write_text("{}", encoding="utf-8")
+
+        with mock.patch.object(storage, "_remove_source_atomically") as remove:
+            with self.assertRaisesRegex(storage.VaultError, "missing required fields"):
+                storage.prune(vault, execute=True)
+
+        remove.assert_not_called()
+        self.assertTrue(first.exists())
+        self.assertTrue(second.exists())
+
     def test_iterator_rejects_untrusted_manifest_identity(self) -> None:
         home = make_codex_home(self.tmp_path)
         make_session(home)
@@ -714,6 +1118,28 @@ class StorageTests(unittest.TestCase):
         self.assertFalse(by_path[str(blocked.relative_to(home))]["eligible"])
         self.assertIn("unreadable", by_path[str(blocked.relative_to(home))]["reason"])
         self.assertTrue(by_path[str(readable.relative_to(home))]["eligible"])
+
+    def test_prune_skips_blob_decompression_when_source_is_absent_or_metadata_changed(self) -> None:
+        home = make_codex_home(self.tmp_path)
+        absent = make_session(home, "sessions/a/rollout-absent.jsonl")
+        changed = make_session(home, "sessions/b/rollout-changed.jsonl")
+        vault = self.tmp_path / "vault"
+        storage.archive(home, vault, older_than_days=1, execute=True)
+        absent.unlink()
+        changed.write_bytes(changed.read_bytes() + b"changed")
+
+        with mock.patch.object(
+            storage,
+            "_verify_one",
+            side_effect=AssertionError("blob should not be decompressed"),
+        ):
+            result = storage.prune(vault, execute=False)
+
+        by_path = {item["relative_path"]: item for item in result["candidates"]}
+        self.assertFalse(by_path[str(absent.relative_to(home))]["eligible"])
+        self.assertIn("does not exist", by_path[str(absent.relative_to(home))]["reason"])
+        self.assertFalse(by_path[str(changed.relative_to(home))]["eligible"])
+        self.assertEqual(by_path[str(changed.relative_to(home))]["reason"], "source metadata changed")
 
     def test_prune_preview_skips_source_path_oserror_and_continues(self) -> None:
         home = make_codex_home(self.tmp_path)

@@ -178,6 +178,12 @@ class CLITests(unittest.TestCase):
         listing = self.run_cli('list', success=False)
         self.assertEqual(listing.returncode, 2)
         self.assertEqual(len(json.loads(listing.stdout)['archives']), 1)
+        human = subprocess.run(
+            [sys.executable, str(ROOT / 'bin/sessioncrate'), '--vault', str(self.vault), 'list'],
+            cwd=self.base, capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(human.returncode, 2)
+        self.assertIn(archive_id, human.stdout)
         costs = self.run_cli('stats', success=False)
         self.assertEqual(costs.returncode, 2)
         payload = json.loads(costs.stdout)
@@ -190,7 +196,55 @@ class CLITests(unittest.TestCase):
         self.assertEqual((destination / self.source.relative_to(self.home)).read_bytes(), self.raw)
         prefix = self.run_cli('restore', archive_id[:16], success=False)
         self.assertEqual(prefix.returncode, 2)
+        self.assertIn('fully inspected', json.loads(prefix.stdout)['error'])
         self.run_cli('verify', archive_id[:16], '--tool', 'codex')
+
+    def test_stats_combines_unfinished_temporary_storage_without_counting_archives(self):
+        self.run_cli('archive', '--execute')
+        paths = [
+            self.vault / 'blobs/.vault-blob-unfinished',
+            self.vault / 'manifests/.vault-tmp-unfinished',
+            self.vault / 'bundles/blobs/.bundle-unfinished',
+            self.vault / 'bundles/manifests/.bundle-manifest-unfinished',
+        ]
+        for path in paths:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b'incomplete')
+        costs = json.loads(self.run_cli('stats').stdout)
+        self.assertEqual(costs['archive_count'], 1)
+        self.assertEqual(costs['temporary_files'], 4)
+        self.assertEqual(costs['temporary_bytes'], 40)
+        self.assertEqual(costs['temporary_allocated_bytes'], sum(path.stat().st_blocks * 512 for path in paths))
+        self.assertEqual(costs['vault_bytes'], costs['blob_bytes'] + costs['manifest_bytes'] + 40)
+        self.assertTrue(all(path.read_bytes() == b'incomplete' for path in paths))
+        selected = json.loads(self.run_cli('stats', '--tool', 'grok').stdout)
+        self.assertEqual(selected['temporary_files'], 0)
+
+    def test_bundle_archive_partial_failure_exits_two_and_keeps_successful_archive(self):
+        from codex_vault import bundles, cli, storage
+        home = self.base / 'exports'
+        home.mkdir()
+        for name in ('healthy', 'failure'):
+            (home / f'{name}.txt').write_text('synthetic session\n')
+        snapshot = bundles._snapshot_bundle
+
+        def fail_selected(root, group, blobs_dir):
+            if group.session_id == 'failure':
+                raise storage.VaultError('synthetic snapshot failure')
+            return snapshot(root, group, blobs_dir)
+
+        output = io.StringIO()
+        with mock.patch.object(bundles, '_snapshot_bundle', side_effect=fail_selected), \
+             contextlib.redirect_stdout(output):
+            status = cli.main(['--vault', str(self.vault), '--json', 'archive', '--tool', 'export',
+                               '--source-root', str(home), '--older-than', '0', '--execute'])
+        result = json.loads(output.getvalue())
+        self.assertEqual(status, 2)
+        self.assertEqual([item['session_id'] for item in result['archived']], ['healthy'])
+        self.assertEqual(len(result['errors']), 1)
+        self.assertEqual(result['skipped'], [])
+        self.assertEqual(len(bundles.list_archives(self.vault)), 1)
+        self.assertEqual(len(list(home.glob('*.txt'))), 2)
 
     def test_codex_search_does_not_read_unselected_bundle_manifests(self):
         self.run_cli('archive', '--execute')
@@ -259,6 +313,33 @@ class CLITests(unittest.TestCase):
         self.assertEqual(status, 2)
         self.assertIn('expand', json.loads(output.getvalue())['error'])
         restore.assert_not_called()
+
+    def test_unexpandable_source_and_vault_homes_are_safe_errors(self):
+        from codex_vault import cli
+        real_expand = Path.expanduser
+
+        def expand(path):
+            if str(path).startswith('~missing-synthetic-user/'):
+                raise RuntimeError('Could not determine home directory')
+            return real_expand(path)
+
+        for option in ('--vault', '--source-root', '--codex-home'):
+            with self.subTest(option=option):
+                output = io.StringIO()
+                with mock.patch.object(Path, 'expanduser', expand), contextlib.redirect_stdout(output):
+                    status = cli.main(['--vault', str(self.vault), '--json', 'scan',
+                                       option, '~missing-synthetic-user/directory'])
+                self.assertEqual(status, 2)
+                self.assertIn('expanded', json.loads(output.getvalue())['error'])
+
+    def test_unexpandable_default_source_home_is_a_safe_error(self):
+        from codex_vault import cli, sources
+        output = io.StringIO()
+        with mock.patch.object(sources, 'default_source_root', side_effect=RuntimeError('Could not determine home directory')), \
+             contextlib.redirect_stdout(output):
+            status = cli.main(['--vault', str(self.vault), '--json', 'scan'])
+        self.assertEqual(status, 2)
+        self.assertIn('expanded', json.loads(output.getvalue())['error'])
 
     def test_human_bundle_scan_displays_path_and_source_bytes(self):
         from codex_vault.cli import _print_human

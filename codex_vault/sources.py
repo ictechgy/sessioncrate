@@ -115,7 +115,19 @@ def valid_relative(tool: str, path: str, source_mode: str) -> bool:
         return tool in _DIAGNOSTIC_TOOLS and len(parts) == 1 and _DIAGNOSTIC_FILENAME.fullmatch(parts[0]) is not None
     if source_mode not in {"native", "export"}:
         return False
-    if any(_is_forbidden_name(part) for part in parts):
+    native_project_layout = (
+        source_mode == "native"
+        and (
+            (tool == "claude" and len(parts) >= 3 and parts[0] == "projects")
+            or (tool == "grok" and len(parts) >= 4 and parts[0] == "sessions")
+            or (tool == "gemini" and len(parts) == 4 and parts[0] == "tmp" and parts[2] == "chats" and parts[3].startswith("session-"))
+        )
+    )
+    if any(
+        _is_forbidden_name(part)
+        for index, part in enumerate(parts)
+        if not (native_project_layout and index == 1)
+    ):
         return False
     if source_mode == "export":
         if any(part.startswith(".") for part in parts):
@@ -351,10 +363,30 @@ def _unreadable_group(tool: str, root: Path, relative: str, *, cwd: str = "", so
         root,
         f"unreadable:{relative}",
         [],
-        [relative],
+        [] if relative == "." else [relative],
         cwd=cwd,
         source_mode=source_mode,
         notes=[f"unreadable directory: {relative}"],
+    )
+
+
+def _discovery_warning_group(
+    tool: str,
+    root: Path,
+    notes: list[str],
+    *,
+    scope: str,
+    source_mode: str = "native",
+) -> SessionGroup:
+    """Keep walk diagnostics separate from independently healthy file groups."""
+    return _group(
+        tool,
+        root,
+        f"discovery-warning:{scope}",
+        [],
+        [],
+        source_mode=source_mode,
+        notes=notes,
     )
 
 
@@ -468,7 +500,9 @@ def _discover_codex(root: Path) -> list[SessionGroup]:
         files, notes = _walk(root, base)
         for path in files:
             if path.endswith(".jsonl"):
-                groups.append(_group("codex", root, Path(path).stem, [path], [path], notes=notes if path == files[0] else []))
+                groups.append(_group("codex", root, Path(path).stem, [path], [path]))
+        if notes:
+            groups.append(_discovery_warning_group("codex", root, notes, scope=scope))
     return groups
 
 
@@ -486,7 +520,9 @@ def _discover_export(tool: str, root: Path) -> list[SessionGroup]:
             continue
         if _is_forbidden_name(Path(path).name):
             continue
-        groups.append(_group(tool, root, Path(path).stem, [path], [path], source_mode="export", notes=notes if path == files[0] else []))
+        groups.append(_group(tool, root, Path(path).stem, [path], [path], source_mode="export"))
+    if notes:
+        groups.append(_discovery_warning_group(tool, root, notes, scope=".", source_mode="export"))
     return groups
 
 

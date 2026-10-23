@@ -46,7 +46,7 @@ sessioncrate stats --json
 sessioncrate stats --tool claude --json  # only Claude archives and their retained originals
 ```
 
-Keeping the originals adds archive storage; space is reclaimed only after verified originals are removed. `stats` counts the archives, metadata, and retained originals. Preview cleanup, then opt in explicitly:
+Keeping the originals adds archive storage; space is reclaimed only after verified originals are removed. `stats` counts the archives, metadata, and retained originals, and reports unfinished temporary files that are still inside the vault. Those temporary files are incomplete artifacts, not validated archives; source quarantines and destination-adjacent restore stages outside the vault are deliberately not included. Preview cleanup, then opt in explicitly:
 
 ```sh
 sessioncrate prune --tool codex
@@ -55,7 +55,11 @@ sessioncrate prune --tool codex --execute
 
 `archive --execute --remove-originals` combines those operations. Originals are removed only after the integrity, source, and activity checks pass. Selected recent, changed, open, unsafe, or unverifiable originals are preserved. Other sessions may remain running; `lsof` checks open file descriptors, not an application's logical session state. Do not reopen the selected session during cleanup. See [compatibility and evidence](docs/compatibility.md) for native resume limits and [release preparation](docs/release.md) for the alpha boundary.
 
-For grouped sessions, age checks include every selected file and directory, including empty companion directories. For bundle adapters such as Claude, `stats --tool TOOL` counts the selected manifests, their unique referenced blobs, and their retained originals; unfiltered `stats` includes all archive blobs, including unreferenced blobs. A blob shared across tool labels is counted once in each relevant tool view and once in the overall view.
+An archive candidate that fails before its manifest is published is reported in `errors`, and the CLI exits with status `2`; other eligible candidates may still be published. Preservation decisions after publication, such as a changed, open, unsafe, or unverifiable original, are reported in `skipped` and do not mean that the archive itself failed.
+
+`prune` first performs inexpensive source existence, type, and metadata checks; bundle pruning also checks source age before reading historical archive blobs. A source that is missing or changed can therefore be skipped without reading its historical archive blob; use `verify` when you need whole-vault archive integrity. Batch pruning fails closed if a recognized manifest is malformed. Keep the damaged record for recovery and use the full ID of an intact archive. `--tool codex` can avoid the bundle namespace, but a bundle tool filter still inspects the shared bundle manifest namespace and cannot isolate every damaged manifest; an unreadable namespace cannot be bypassed by a tool filter.
+
+For grouped sessions, age checks include every selected file and directory, including empty companion directories. For bundle adapters such as Claude, `stats --tool TOOL` counts the selected manifests, their unique referenced blobs, and their retained originals; unfiltered `stats` includes all archive blobs, including unreferenced blobs. A blob shared across tool labels is counted once in each relevant tool view and once in the overall view. In the top-level stats result, `temporary_files`, `temporary_bytes`, and `temporary_allocated_bytes` sum unfinished files from both namespaces. The nested `codex` result exposes the legacy `temporary_*` fields, while nested `bundles` exposes `bundle_temporary_files`, `bundle_temporary_bytes`, and `bundle_temporary_allocated_bytes`. Tool-filtered bundle stats cannot attribute those shared temporary files and reports the bundle temporary fields as zero.
 
 ## Supported sources
 
@@ -123,9 +127,9 @@ sessioncrate restore ARCHIVE_ID --execute          # original recorded location
 
 A unique archive-ID prefix is accepted. SHA-256 and compressed/member integrity checks complete before an archive is accepted for restoration. Restore refuses existing files with different bytes and leaves equal files in place. Original paths, bytes, permissions, and modification times are recorded where the source format supports them.
 
-`list` reports valid entries alongside manifest errors, and `verify` aggregates failures. If one archive namespace cannot be searched, `search` returns healthy namespaces' matches with `partial: true` and `errors`; human output also identifies the failed namespace. An unrelated damaged manifest does not block full-ID recovery of an intact archive. A damaged matching prefix requires the full intact ID or an explicit tool scope. Integrity and operational errors, including partial searches, return exit code `2`.
+`list` reports valid entries alongside manifest errors, and `verify` aggregates failures. If one archive namespace cannot be searched, `search` returns healthy namespaces' matches with `partial: true` and `errors`; human output also identifies the failed namespace. When `list` has errors, its valid rows include full archive IDs so an intact entry can still be selected. An unrelated damaged manifest does not block full-ID recovery of an intact archive. A damaged matching prefix requires the full intact ID. `--tool codex` can avoid an unrelated bundle namespace, but a bundle tool filter still encounters malformed manifests in the shared bundle namespace, and no tool filter can bypass an unreadable namespace. Integrity and operational errors, including partial searches, return exit code `2`.
 
-Grouped restore uses a private staging directory near the destination. A crash can leave a `.codex-vault-restore-stage-*` plaintext staging directory; there is no automatic crash scavenger. Multiple session roots are not published as one filesystem transaction. Compression is not encryption.
+Grouped restore uses a private staging directory near the destination. A crash can leave a `.codex-vault-restore-stage-*` plaintext staging directory; source-side archive or prune failures can also retain a quarantine for recovery. These paths are outside the vault's stats accounting and there is no automatic crash scavenger or quarantine cleanup. Multiple session roots are not published as one filesystem transaction. Compression is not encryption.
 
 ## Codex skill and compatibility
 

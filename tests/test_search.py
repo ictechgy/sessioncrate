@@ -194,6 +194,42 @@ class SearchTests(unittest.TestCase):
                     search(vault, "secret")
                 self.assertNotIn("secret", str(error.exception))
 
+    def test_decoder_value_limit_skips_record_and_continues_search_and_show(self):
+        records = [
+            {"opaque": "synthetic decoder limit"},
+            {"type": "event_msg", "payload": {"type": "user_message", "message": "needle"}},
+        ]
+        loads = json.loads
+
+        def bounded_loads(line):
+            if "synthetic decoder limit" in line:
+                raise ValueError("synthetic decoder limit")
+            return loads(line)
+
+        with tempfile.TemporaryDirectory() as temp:
+            vault, manifest = _archive_fixture(Path(temp), records)
+            with patch("codex_vault.search.list_archives", return_value=[manifest]), \
+                 patch("codex_vault.search.resolve_archive", return_value=manifest), \
+                 patch("codex_vault.search.json.loads", side_effect=bounded_loads):
+                found = search(vault, "needle")
+                shown = show(vault, manifest["archive_id"])
+            self.assertEqual(len(found["matches"]), 1)
+            self.assertEqual(shown["records"][0]["text"], "needle")
+            self.assertEqual(found["skipped_records"], 1)
+            self.assertEqual(shown["skipped_records"], 1)
+
+    def test_large_json_integer_does_not_report_corrupt_archive(self):
+        records = [
+            b'{"opaque":' + b"9" * 5000 + b"}\n",
+            {"type": "event_msg", "payload": {"type": "user_message", "message": "needle"}},
+        ]
+        with tempfile.TemporaryDirectory() as temp:
+            vault, manifest = _archive_fixture(Path(temp), records)
+            with patch("codex_vault.search.list_archives", return_value=[manifest]):
+                found = search(vault, "needle")
+            self.assertEqual(len(found["matches"]), 1)
+            self.assertEqual(found["skipped_records"], 1)
+
     def test_zstandard_errors_are_not_mislabeled_as_gzip_corruption(self):
         with tempfile.TemporaryDirectory() as temp:
             vault, manifest = _archive_fixture(Path(temp), [])

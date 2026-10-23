@@ -50,6 +50,8 @@ _PRIVATE_FILE = 0o600
 _DAY_NS = 86_400 * 1_000_000_000
 _HOUR_NS = 3_600 * 1_000_000_000
 _MAX_META_LINE = 16 * 1024 * 1024
+_MAX_MANIFEST_BYTES = 32 * 1024 * 1024
+_MAX_JSON_INTEGER_DIGITS = 20
 _MAX_ZSTD_RECORD_BYTES = _MAX_META_LINE
 _MIN_ZSTD_DECODED_BYTES = 64 * 1024 * 1024
 _MAX_ZSTD_DECODED_BYTES = 8 * 1024 * 1024 * 1024
@@ -177,6 +179,34 @@ def _safe_vault_subdir(vault: Path, name: str, *, create: bool) -> Path | None:
     return path
 
 
+def _temporary_file_stats(directory: Path | None, prefix: str) -> tuple[int, int, int]:
+    """Measure unfinished archive files without following links."""
+
+    if directory is None:
+        return 0, 0, 0
+    count = 0
+    logical_bytes = 0
+    allocated_bytes = 0
+    try:
+        entries = os.scandir(directory)
+    except OSError:
+        return 0, 0, 0
+    with entries:
+        for entry in entries:
+            if not entry.name.startswith(prefix):
+                continue
+            try:
+                item = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if not stat.S_ISREG(item.st_mode):
+                continue
+            count += 1
+            logical_bytes += int(item.st_size)
+            allocated_bytes += int(getattr(item, "st_blocks", 0)) * 512
+    return count, logical_bytes, allocated_bytes
+
+
 def _fsync_directory(path: Path) -> None:
     try:
         fd = os.open(path, os.O_RDONLY)
@@ -196,16 +226,51 @@ def _vault_lock(vault_dir: Path | str, *, exclusive: bool, create: bool) -> Iter
     lock_path = vault / ".lock"
     _check_path_components(lock_path)
     lock_stat = _lstat(lock_path)
-    if lock_stat is not None and stat.S_ISLNK(lock_stat.st_mode):
-        raise VaultError("vault lock is a symlink")
-    flags = os.O_RDWR | os.O_CREAT
+    if lock_stat is not None and (
+        stat.S_ISLNK(lock_stat.st_mode) or not stat.S_ISREG(lock_stat.st_mode)
+    ):
+        raise VaultError("vault lock must be a regular non-symlink file")
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    created = False
     try:
-        fd = os.open(lock_path, flags, _PRIVATE_FILE)
+        if lock_stat is None:
+            try:
+                fd = os.open(
+                    lock_path,
+                    os.O_RDWR | os.O_CREAT | os.O_EXCL | nofollow,
+                    _PRIVATE_FILE,
+                )
+                created = True
+            except FileExistsError:
+                lock_stat = _lstat(lock_path)
+                if lock_stat is None:
+                    raise VaultError("vault lock changed while being opened")
+                fd = os.open(lock_path, os.O_RDWR | nofollow)
+        else:
+            fd = os.open(lock_path, os.O_RDWR | nofollow)
     except OSError as exc:
         raise VaultError(f"cannot open vault lock: {exc}") from exc
-    os.fchmod(fd, _PRIVATE_FILE)
-    operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
     try:
+        opened = os.fstat(fd)
+        if created:
+            lock_stat = opened
+        expected_identity = (int(opened.st_dev), int(opened.st_ino))
+        if (
+            lock_stat is None
+            or not stat.S_ISREG(opened.st_mode)
+            or stat.S_ISLNK(opened.st_mode)
+            or (int(lock_stat.st_dev), int(lock_stat.st_ino)) != expected_identity
+            or not _matches_regular_identity(_lstat(lock_path), expected_identity)
+        ):
+            raise VaultError("vault lock changed while being opened")
+        # Only chmod an inode created by this process. An existing pathname may
+        # have been supplied by another account-local actor, so changing its
+        # mode would risk modifying an unrelated hard-linked file.
+        if created:
+            if opened.st_nlink != 1:
+                raise VaultError("new vault lock has an unexpected hard-link count")
+            os.fchmod(fd, _PRIVATE_FILE)
+        operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
         try:
             fcntl.flock(fd, operation | fcntl.LOCK_NB)
         except (BlockingIOError, OSError) as exc:
@@ -215,6 +280,8 @@ def _vault_lock(vault_dir: Path | str, *, exclusive: bool, create: bool) -> Iter
             }:
                 raise VaultError("vault is locked by another operation; retry later") from exc
             raise VaultError(f"cannot lock vault: {exc}") from exc
+        if not _matches_regular_identity(_lstat(lock_path), expected_identity):
+            raise VaultError("vault lock changed before operation")
         yield vault
     finally:
         try:
@@ -246,13 +313,47 @@ def _safe_regular(path: Path, *, label: str) -> os.stat_result:
     return st
 
 
-def _read_json(path: Path) -> Any:
+def _bounded_json_int(value: str) -> int:
+    digits = value[1:] if value.startswith("-") else value
+    if len(digits) > _MAX_JSON_INTEGER_DIGITS:
+        raise ValueError("JSON integer exceeds supported range")
+    return int(value)
+
+
+def _read_json(path: Path, *, max_bytes: int, expected: os.stat_result) -> Any:
     fd = _open_nofollow(path, os.O_RDONLY)
     try:
-        with os.fdopen(fd, "r", encoding="utf-8") as stream:
-            return json.load(stream)
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise VaultError(f"invalid JSON file: {path}: {exc}") from exc
+        opened = os.fstat(fd)
+        expected_identity = _stat_identity(expected)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or _stat_identity(opened) != expected_identity
+        ):
+            raise VaultError("manifest changed while being opened")
+        stream = os.fdopen(fd, "rb")
+        fd = -1
+        with stream:
+            encoded = stream.read(max_bytes + 1)
+            after = os.fstat(stream.fileno())
+        if len(encoded) > max_bytes:
+            raise VaultError("manifest exceeds maximum size")
+        current = _lstat(path)
+        if (
+            _stat_identity(after) != expected_identity
+            or current is None
+            or not stat.S_ISREG(current.st_mode)
+            or stat.S_ISLNK(current.st_mode)
+            or _stat_identity(current) != expected_identity
+        ):
+            raise VaultError("manifest changed while being read")
+        return json.loads(encoded.decode("utf-8"), parse_int=_bounded_json_int)
+    except VaultError:
+        raise
+    except (OSError, UnicodeError, ValueError, RecursionError, OverflowError) as exc:
+        raise VaultError("manifest is invalid JSON") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
 
 def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
@@ -531,10 +632,9 @@ def _manifest_path(vault: Path, archive_id: str) -> Path:
 
 def _read_manifest_path(path: Path, *, expected_id: str | None = None) -> dict[str, Any]:
     st = _safe_regular(path, label="manifest")
-    try:
-        raw = _read_json(path)
-    except VaultError:
-        raise
+    if st.st_size > _MAX_MANIFEST_BYTES:
+        raise VaultError("manifest exceeds maximum size")
+    raw = _read_json(path, max_bytes=_MAX_MANIFEST_BYTES, expected=st)
     return _valid_manifest(raw, expected_id=expected_id)
 
 
@@ -635,6 +735,47 @@ def verified_blob_path(vault_dir: Path, manifest: dict[str, Any]) -> Path:
     return _blob_path(vault, manifest)
 
 
+class _DigestingReader:
+    """Account for bytes read without taking ownership of the wrapped stream."""
+
+    def __init__(self, stream: Any):
+        self._stream = stream
+        self._digest = hashlib.sha256()
+        self.total = 0
+
+    def _account(self, data: bytes) -> bytes:
+        self._digest.update(data)
+        self.total += len(data)
+        return data
+
+    def read(self, size: int = -1) -> bytes:
+        return self._account(self._stream.read(size))
+
+    def readline(self, size: int = -1) -> bytes:
+        return self._account(self._stream.readline(size))
+
+    def hexdigest(self) -> str:
+        return self._digest.hexdigest()
+
+
+def _require_unchanged_open_blob(
+    path: Path,
+    fd: int,
+    expected: tuple[int, int, int, int, int, int],
+) -> None:
+    opened = os.fstat(fd)
+    current = _lstat(path)
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or _stat_identity(opened) != expected
+        or current is None
+        or not stat.S_ISREG(current.st_mode)
+        or stat.S_ISLNK(current.st_mode)
+        or _stat_identity(current) != expected
+    ):
+        raise VaultError(f"archive blob changed while being read: {path}")
+
+
 def iter_archive_lines(
     vault_dir: Path,
     manifest: dict[str, Any],
@@ -656,7 +797,6 @@ def iter_archive_lines(
     if _is_zstd_relative(checked["relative_path"]) and not zstd_io.is_available():
         raise VaultError("Zstandard content requires Python 3.14+")
     blob = _blob_path(vault, checked)
-    _verify_gzip(blob, checked["blob_sha256"], checked["raw_bytes"])
 
     if max_record_bytes is not None and (
         isinstance(max_record_bytes, bool)
@@ -719,26 +859,57 @@ def iter_archive_lines(
         if expected_bytes is not None and total != expected_bytes:
             raise VaultError("Zstandard decoded size mismatch")
 
+    expected_path = _safe_regular(blob, label="archive blob")
+    fd = _open_nofollow(blob, os.O_RDONLY)
+    fd_open = True
     try:
-        with gzip.open(blob, "rb") as original:
-            if not _is_zstd_relative(checked["relative_path"]):
-                yield from lines_from(original)
-                return
-            try:
-                with zstd_io.open_reader(original) as decoded:
-                    yield from lines_from(
-                        decoded,
-                        expected_bytes=checked["decoded_bytes"],
-                        decoded_limit=_zstd_decoded_limit(checked["raw_bytes"]),
-                    )
-            except zstd_io.ZstdUnavailableError as exc:
-                raise VaultError(str(exc)) from exc
-            except zstd_io.decode_errors() as exc:
-                raise VaultError(
-                    "Zstandard session is corrupt, truncated, or has trailing data"
-                ) from exc
+        opened = os.fstat(fd)
+        expected_identity = _stat_identity(expected_path)
+        if not stat.S_ISREG(opened.st_mode) or _stat_identity(opened) != expected_identity:
+            raise VaultError(f"archive blob changed before it could be read: {blob}")
+        raw = os.fdopen(fd, "rb")
+        fd_open = False
+        with raw:
+            _verify_gzip(
+                blob,
+                checked["blob_sha256"],
+                checked["raw_bytes"],
+                fileobj=raw,
+            )
+            _require_unchanged_open_blob(blob, raw.fileno(), expected_identity)
+            raw.seek(0)
+            with gzip.GzipFile(fileobj=raw, mode="rb") as original:
+                source = _DigestingReader(original)
+                if not _is_zstd_relative(checked["relative_path"]):
+                    yield from lines_from(source)
+                else:
+                    try:
+                        with zstd_io.open_reader(source) as decoded:
+                            yield from lines_from(
+                                decoded,
+                                expected_bytes=checked["decoded_bytes"],
+                                decoded_limit=_zstd_decoded_limit(checked["raw_bytes"]),
+                            )
+                    except zstd_io.ZstdUnavailableError as exc:
+                        raise VaultError(str(exc)) from exc
+                    except zstd_io.decode_errors() as exc:
+                        raise VaultError(
+                            "Zstandard session is corrupt, truncated, or has trailing data"
+                        ) from exc
+                if (
+                    source.total != checked["raw_bytes"]
+                    or source.hexdigest() != checked["blob_sha256"]
+                ):
+                    raise VaultError(f"archive blob digest or size changed while being read: {blob}")
+            _require_unchanged_open_blob(blob, raw.fileno(), expected_identity)
     except (OSError, EOFError, gzip.BadGzipFile, zlib.error) as exc:
         raise VaultError(f"cannot read archive blob: {blob}: {exc}") from exc
+    finally:
+        if fd_open:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 def _hash_stream(stream: Any) -> tuple[str, int]:
@@ -758,12 +929,23 @@ def _hash_path(path: Path) -> tuple[str, int, os.stat_result]:
     fd = _open_nofollow(path, os.O_RDONLY)
     try:
         opened = os.fstat(fd)
-        if (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino):
-            raise VaultError("source changed before it could be read")
+        expected_identity = _stat_identity(expected)
+        if not stat.S_ISREG(opened.st_mode) or _stat_identity(opened) != expected_identity:
+            raise VaultError("file changed before it could be read")
         stream = os.fdopen(fd, "rb")
         fd = -1
         with stream:
             digest, size = _hash_stream(stream)
+            after = os.fstat(stream.fileno())
+            current = _lstat(path)
+            if (
+                _stat_identity(after) != expected_identity
+                or current is None
+                or not stat.S_ISREG(current.st_mode)
+                or stat.S_ISLNK(current.st_mode)
+                or _stat_identity(current) != expected_identity
+            ):
+                raise VaultError("file changed while being read")
     except Exception:
         if fd >= 0:
             try:
@@ -771,7 +953,7 @@ def _hash_path(path: Path) -> tuple[str, int, os.stat_result]:
             except OSError:
                 pass
         raise
-    return digest, size, expected
+    return digest, size, after
 
 
 def _parse_session_meta(first: bytes, path: Path) -> dict[str, Any]:
@@ -779,7 +961,7 @@ def _parse_session_meta(first: bytes, path: Path) -> dict[str, Any]:
         raise VaultError(f"session does not start with a bounded session_meta record: {path}")
     try:
         record = json.loads(first.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
         raise VaultError(f"first session record is invalid JSON: {path}") from exc
     if not isinstance(record, dict):
         raise VaultError(f"first session record must be an object: {path}")
@@ -823,11 +1005,22 @@ def _metadata_fields(record: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def _verify_gzip(path: Path, expected_sha: str, expected_size: int) -> None:
+def _verify_gzip(
+    path: Path,
+    expected_sha: str,
+    expected_size: int,
+    *,
+    fileobj: Any | None = None,
+) -> None:
     digest = hashlib.sha256()
     total = 0
     try:
-        with gzip.open(path, "rb") as stream:
+        if fileobj is None:
+            stream_context = gzip.open(path, "rb")
+        else:
+            fileobj.seek(0)
+            stream_context = gzip.GzipFile(fileobj=fileobj, mode="rb")
+        with stream_context as stream:
             while True:
                 chunk = stream.read(1024 * 1024)
                 if not chunk:
@@ -1315,6 +1508,15 @@ def restore(
             "restored": False,
             "skipped": False,
         }
+        existing = _lstat(target)
+        if existing is not None:
+            if stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode):
+                raise VaultError(f"destination is an unsafe non-regular file: {target}")
+            existing_sha, existing_size, _ = _hash_path(target)
+            if existing_size == manifest["raw_bytes"] and existing_sha == manifest["blob_sha256"]:
+                result["skipped"] = True
+                return result
+            raise VaultError(f"destination already contains different bytes: {target}")
         if not execute:
             return result
         blob = _blob_path(vault, manifest)
@@ -1341,16 +1543,6 @@ def restore(
                 raise VaultError("archive digest changed during restore")
             os.utime(temp, ns=(manifest["source_mtime_ns"], manifest["source_mtime_ns"]))
             _fsync_directory(target.parent)
-            existing = _lstat(target)
-            if existing is not None:
-                if stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode):
-                    raise VaultError(f"destination is an unsafe non-regular file: {target}")
-                existing_sha, existing_size, _ = _hash_path(target)
-                if existing_size == total and existing_sha == digest.hexdigest():
-                    result["skipped"] = True
-                    temp.unlink(missing_ok=True)
-                    return result
-                raise VaultError(f"destination already contains different bytes: {target}")
             published = _publish_temp_no_replace(temp, target, mode=manifest["source_mode"] & 0o1777)
             if not published:
                 existing_sha, existing_size, _ = _hash_path(target)
@@ -1369,7 +1561,7 @@ def restore(
             raise
 
 
-def _source_matches_manifest(path: Path, manifest: dict[str, Any]) -> tuple[bool, str]:
+def _source_metadata_matches_manifest(path: Path, manifest: dict[str, Any]) -> tuple[bool, str]:
     try:
         st = _safe_regular(path, label="source")
         if (
@@ -1378,9 +1570,24 @@ def _source_matches_manifest(path: Path, manifest: dict[str, Any]) -> tuple[bool
             or stat.S_IMODE(st.st_mode) != manifest["source_mode"]
         ):
             return False, "source metadata changed"
-        sha, size, _ = _hash_path(path)
+        return True, "source metadata matches"
+    except (VaultError, OSError) as exc:
+        return False, str(exc)
+
+
+def _source_matches_manifest(path: Path, manifest: dict[str, Any]) -> tuple[bool, str]:
+    metadata_matches, reason = _source_metadata_matches_manifest(path, manifest)
+    if not metadata_matches:
+        return False, reason
+    try:
+        sha, size, hashed_stat = _hash_path(path)
         if size != manifest["raw_bytes"] or sha != manifest["blob_sha256"]:
             return False, "source bytes changed"
+        if (
+            hashed_stat.st_mtime_ns != manifest["source_mtime_ns"]
+            or stat.S_IMODE(hashed_stat.st_mode) != manifest["source_mode"]
+        ):
+            return False, "source metadata changed"
         return True, "eligible"
     except (VaultError, OSError) as exc:
         return False, str(exc)
@@ -1536,14 +1743,18 @@ def prune(vault_dir: Path, archive_id: str | None = None, execute: bool = False)
         manifests = [_resolve_archive_unlocked(vault, archive_id)] if archive_id is not None else list(_iter_valid_manifests(vault))
         entries: list[dict[str, Any]] = []
         for manifest in manifests:
-            check = _verify_one(vault, manifest)
-            if not check["ok"]:
-                entries.append({"archive_id": manifest["archive_id"], "relative_path": manifest["relative_path"], "eligible": False, "reason": check["error"]})
-                continue
             try:
                 source = _source_path_for_manifest(manifest)
             except (VaultError, OSError) as exc:
                 entries.append({"archive_id": manifest["archive_id"], "relative_path": manifest["relative_path"], "eligible": False, "reason": str(exc)})
+                continue
+            metadata_matches, reason = _source_metadata_matches_manifest(source, manifest)
+            if not metadata_matches:
+                entries.append({"archive_id": manifest["archive_id"], "relative_path": manifest["relative_path"], "eligible": False, "reason": reason})
+                continue
+            check = _verify_one(vault, manifest)
+            if not check["ok"]:
+                entries.append({"archive_id": manifest["archive_id"], "relative_path": manifest["relative_path"], "eligible": False, "reason": check["error"]})
                 continue
             matches, reason = _source_matches_manifest(source, manifest)
             entry = {"archive_id": manifest["archive_id"], "relative_path": manifest["relative_path"], "eligible": False, "reason": reason}
@@ -1613,6 +1824,9 @@ def stats(vault_dir: Path) -> dict[str, Any]:
             "allocated_bytes": 0,
             "net_storage_bytes": 0,
             "compression_savings_estimate_bytes": 0,
+            "temporary_files": 0,
+            "temporary_bytes": 0,
+            "temporary_allocated_bytes": 0,
         }
     with _vault_lock(vault, exclusive=False, create=False):
         manifests = list(_iter_valid_manifests(vault))
@@ -1633,10 +1847,20 @@ def stats(vault_dir: Path) -> dict[str, Any]:
         if manifests_dir is not None:
             for entry in os.scandir(manifests_dir):
                 st = entry.stat(follow_symlinks=False)
-                if stat.S_ISREG(st.st_mode) and not stat.S_ISLNK(st.st_mode) and entry.name.endswith(".json"):
+                if (
+                    stat.S_ISREG(st.st_mode)
+                    and not stat.S_ISLNK(st.st_mode)
+                    and not entry.name.startswith(".vault-tmp-")
+                    and entry.name.endswith(".json")
+                ):
                     manifest_bytes += st.st_size
                     manifest_allocated += getattr(st, "st_blocks", 0) * 512
-        vault_bytes = blob_bytes + manifest_bytes
+        blob_temporary = _temporary_file_stats(blobs_dir, ".vault-blob-")
+        manifest_temporary = _temporary_file_stats(manifests_dir, ".vault-tmp-")
+        temporary_files = blob_temporary[0] + manifest_temporary[0]
+        temporary_bytes = blob_temporary[1] + manifest_temporary[1]
+        temporary_allocated_bytes = blob_temporary[2] + manifest_temporary[2]
+        vault_bytes = blob_bytes + manifest_bytes + temporary_bytes
         raw_bytes = sum(item["raw_bytes"] for item in manifests)
         retained_source_bytes = 0
         retained_paths: set[tuple[str, str]] = set()
@@ -1668,7 +1892,10 @@ def stats(vault_dir: Path) -> dict[str, Any]:
             "manifest_bytes": manifest_bytes,
             "vault_bytes": vault_bytes,
             "stored_bytes": vault_bytes,
-            "allocated_bytes": allocated + manifest_allocated,
+            "allocated_bytes": allocated + manifest_allocated + temporary_allocated_bytes,
+            "temporary_files": temporary_files,
+            "temporary_bytes": temporary_bytes,
+            "temporary_allocated_bytes": temporary_allocated_bytes,
             # ``managed_bytes`` is the current measured storage owned by the
             # vault plus distinct source paths that are still present.  The
             # raw total is historical when one source path has multiple

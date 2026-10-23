@@ -270,6 +270,68 @@ class SourceAdapterTests(unittest.TestCase):
             self.assertTrue(any("unreadable directory" in note for note in gemini_bad_group.notes))
             self.assertTrue(any(group.files == ("tmp/good/chats/session-healthy.json",) for group in gemini_groups))
 
+    def test_discovery_warning_does_not_block_filtered_codex_or_export_file(self):
+        """Walk diagnostics stay separate from healthy files filtered by the adapter."""
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            codex_root = base / "codex"
+            codex_scope = codex_root / "sessions" / "project"
+            blocked_codex = codex_scope / "blocked"
+            blocked_codex.mkdir(parents=True)
+            (codex_scope / "a.db").write_bytes(b"SQLite format 3\x00")
+            (codex_scope / "healthy.jsonl").write_text('{}\n', encoding="utf-8")
+
+            export_root = base / "exports"
+            blocked_export = export_root / "blocked"
+            blocked_export.mkdir(parents=True)
+            (export_root / "a.db").write_bytes(b"SQLite format 3\x00")
+            (export_root / "healthy.md").write_text("healthy", encoding="utf-8")
+
+            real_scandir = os.scandir
+
+            def blocked_scandir(path):
+                if Path(path) in {blocked_codex, blocked_export}:
+                    raise PermissionError("synthetic unreadable directory")
+                return real_scandir(path)
+
+            # Discovery is metadata-only; no archive call or transcript bytes are read.
+            with mock.patch("codex_vault.sources.os.scandir", side_effect=blocked_scandir):
+                codex_groups = discover("codex", codex_root)
+                export_groups = discover("export", export_root)
+
+            codex_healthy = next(group for group in codex_groups if group.files == ("sessions/project/healthy.jsonl",))
+            self.assertTrue(codex_healthy.removable)
+            self.assertFalse(codex_healthy.notes)
+            codex_warning = next(group for group in codex_groups if not group.root_entries)
+            self.assertFalse(codex_warning.removable)
+            self.assertTrue(any("unreadable directory" in note for note in codex_warning.notes))
+
+            export_healthy = next(group for group in export_groups if group.files == ("healthy.md",))
+            self.assertTrue(export_healthy.removable)
+            self.assertFalse(export_healthy.notes)
+            export_warning = next(group for group in export_groups if not group.root_entries)
+            self.assertFalse(export_warning.removable)
+            self.assertTrue(any("unreadable directory" in note for note in export_warning.notes))
+
+    def test_diagnostic_scope_warning_has_no_fake_root_entry(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "diagnostic-logs"
+            root.mkdir()
+            real_scandir = os.scandir
+
+            def blocked_scandir(path):
+                if Path(path) == root:
+                    raise PermissionError("synthetic unreadable diagnostic root")
+                return real_scandir(path)
+
+            with mock.patch("codex_vault.sources.os.scandir", side_effect=blocked_scandir):
+                groups = discover("zcode", root)
+
+            self.assertEqual(len(groups), 1)
+            self.assertEqual(groups[0].root_entries, ())
+            self.assertFalse(groups[0].removable)
+            self.assertTrue(any("unreadable directory" in note for note in groups[0].notes))
+
     def test_native_discovery_reports_inaccessible_top_level_scope(self):
         with tempfile.TemporaryDirectory() as temp:
             base = Path(temp)
@@ -438,6 +500,22 @@ class SourceAdapterTests(unittest.TestCase):
         self.assertFalse(valid_relative("agy", "secret.pem", "export"))
         self.assertFalse(valid_relative("agy", ".credentials.json", "export"))
         self.assertFalse(valid_relative("export", ".hidden/chat.md", "export"))
+
+    def test_native_project_identifiers_allow_credential_like_path_terms_only(self):
+        self.assertTrue(valid_relative("claude", "projects/-Users-fixture-my-account-app/sid.jsonl", "native"))
+        self.assertTrue(valid_relative("claude", "projects/-Users-fixture-my-secret-app/sid.jsonl", "native"))
+        self.assertTrue(valid_relative("grok", "sessions/%2Fwork%2Fmy-token-app/session-1/updates.jsonl", "native"))
+        self.assertTrue(valid_relative("gemini", "tmp/my-secret-app/chats/session-1.json", "native"))
+
+        self.assertFalse(valid_relative("claude", "projects/-Users-fixture-my-account-app/sid/auth.json", "native"))
+        self.assertFalse(valid_relative("claude", "projects/-Users-fixture-my-token-app/sid/token-results/output.txt", "native"))
+        self.assertFalse(valid_relative("grok", "sessions/%2Fwork%2Fmy-token-app/session-1/token.txt", "native"))
+        self.assertFalse(valid_relative("gemini", "tmp/my-secret-app/chats/session-secret.json", "native"))
+
+        self.assertFalse(valid_relative("claude", "exports/my-account-app/session.jsonl", "native"))
+        self.assertFalse(valid_relative("claude", "projects/my-account-app", "native"))
+        self.assertFalse(valid_relative("unknown", "projects/my-account-app/session.jsonl", "native"))
+        self.assertFalse(valid_relative("claude", "projects/my-account-app/session.jsonl", "other"))
 
     def test_iter_text_records_handles_claude_grok_and_images(self):
         lines = [

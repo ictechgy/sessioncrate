@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import io
 import json
 import os
 import stat
@@ -109,6 +110,13 @@ def _write_embedded_archive(base: Path, *, with_source: bool = True) -> tuple[Pa
         json.dumps(manifest, ensure_ascii=False), encoding="utf-8"
     )
     return vault, source, manifest
+
+
+def _stored_gzip_bytes(payload: bytes) -> bytes:
+    output = io.BytesIO()
+    with gzip.GzipFile(fileobj=output, mode="wb", compresslevel=0, mtime=0) as stream:
+        stream.write(payload)
+    return output.getvalue()
 
 
 @unittest.skipUnless(stdlib_zstd is not None, "Python 3.14 Zstandard backend is unavailable")
@@ -231,6 +239,32 @@ class ZstdArchiveTests(unittest.TestCase):
         with self.assertRaisesRegex(storage.VaultError, "decoded size mismatch"):
             list(storage.iter_archive_lines(vault, manifest))
 
+    def test_reader_rejects_same_size_zstd_blob_replacement_after_preverification(self) -> None:
+        home = make_codex_home(self.tmp_path)
+        decoded = _jsonl(*_records())
+        original = stdlib_zstd.compress(decoded)
+        _write_old(home / "sessions/project/rollout-race.jsonl.zst", original)
+        vault = self.tmp_path / "vault"
+        storage.archive(home, vault, older_than_days=1, execute=True)
+        manifest = storage.list_archives(vault)[0]
+        blob = vault / manifest["blob"]
+        replacement_decoded = decoded.replace(b"zstd-project", b"zstd-projecX")
+        replacement_raw = stdlib_zstd.compress(replacement_decoded)
+        replacement = self.tmp_path / "replacement.jsonl.gz"
+        replacement.write_bytes(_stored_gzip_bytes(replacement_raw))
+        self.assertEqual(len(replacement_raw), len(original))
+        self.assertEqual(replacement.stat().st_size, blob.stat().st_size)
+        real_verify = storage._verify_gzip
+
+        def replace_after_verify(*args, **kwargs):
+            result = real_verify(*args, **kwargs)
+            os.replace(replacement, blob)
+            return result
+
+        with mock.patch.object(storage, "_verify_gzip", side_effect=replace_after_verify):
+            with self.assertRaisesRegex(storage.VaultError, "changed while being read"):
+                list(storage.iter_archive_lines(vault, manifest))
+
     def test_default_raw_iterator_rejects_overlong_zstd_record_with_small_patched_cap(self) -> None:
         home = make_codex_home(self.tmp_path)
         metadata, _ = _records()
@@ -288,14 +322,37 @@ class ZstdCompatibilityTests(unittest.TestCase):
                 return next(self.lines)
 
         reader = FakeReader()
+        def open_reader(source):
+            self.assertEqual(source.read(), _EMBEDDED_ZSTD)
+            return reader
+
         with mock.patch.object(zstd_io, "is_available", return_value=True), mock.patch.object(
-            zstd_io, "open_reader", return_value=reader
+            zstd_io, "open_reader", side_effect=open_reader
         ), mock.patch.object(storage, "_verify_gzip", return_value=None), mock.patch.object(
             storage, "_MAX_ZSTD_RECORD_BYTES", 123
         ):
             self.assertEqual(list(storage.iter_archive_lines(vault, manifest)), [line])
 
         self.assertEqual(reader.sizes, [124, 124])
+
+    def test_reader_hashes_the_borrowed_zstd_source_wrapper(self) -> None:
+        vault, _, manifest = _write_embedded_archive(self.tmp_path)
+        borrowed_sources = []
+
+        def open_reader(source):
+            borrowed_sources.append(source)
+            self.assertEqual(source.read(), _EMBEDDED_ZSTD)
+            return io.BytesIO(_EMBEDDED_PAYLOAD)
+
+        with mock.patch.object(zstd_io, "is_available", return_value=True), mock.patch.object(
+            zstd_io, "open_reader", side_effect=open_reader
+        ), mock.patch.object(storage, "_verify_gzip", return_value=None):
+            lines = list(storage.iter_archive_lines(vault, manifest))
+
+        self.assertEqual(b"".join(lines), _EMBEDDED_PAYLOAD)
+        self.assertEqual(len(borrowed_sources), 1)
+        self.assertEqual(borrowed_sources[0].total, manifest["raw_bytes"])
+        self.assertEqual(borrowed_sources[0].hexdigest(), manifest["blob_sha256"])
 
     def test_reader_rejects_decoded_size_overrun_before_reading_again(self) -> None:
         vault, _, manifest = _write_embedded_archive(self.tmp_path)

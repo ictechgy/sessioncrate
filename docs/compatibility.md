@@ -27,3 +27,13 @@ Record the operating system, filesystem, source layout, supported/refused cases,
 Until that evidence exists, prefer copy-only archiving and test alternate-destination restoration. Removing old records can leave stale application list/index entries even when the archived bytes are intact.
 
 Diagnostic logs need the same caution as any raw application log: they may include secrets, and SessionCrate does not promise universal redaction. Select only a dedicated log directory you have reviewed.
+
+## Cleanup and recovery accounting
+
+`prune` performs a cheap source existence, type, and metadata pass before reading historical archive blobs; bundle pruning also checks source age before reading the blob. Missing, non-regular, or changed sources can therefore be reported as skipped without proving that the corresponding archive blob is healthy. Run `verify` when you need whole-vault integrity checks. A batch prune fails closed when a recognized manifest is malformed; use the full ID of an intact entry. `--tool codex` can avoid the bundle namespace, but a bundle tool filter still inspects the shared bundle manifest namespace and cannot isolate every damaged manifest. A full known intact ID can bypass an unrelated malformed manifest file, while an unreadable namespace cannot be bypassed by a tool filter.
+
+Archive failures that happen before a manifest is published appear in `errors` and make the CLI return status `2`. A published archive can still be retained while its original is reported in `skipped` because the source changed, is open, or could not be proven safe to remove.
+
+Stats include unfinished temporary files found inside the vault. In the top-level result, `temporary_files`, `temporary_bytes`, and `temporary_allocated_bytes` sum both namespaces; nested `codex` exposes the legacy `temporary_*` fields and nested `bundles` exposes `bundle_temporary_*`. The byte fields are logical sizes; the `*_allocated_bytes` fields use filesystem allocation where available. These files are counted as storage that exists, but they are incomplete artifacts and are not validated archives. Bundle temporary files cannot be attributed to a selected tool, so tool-filtered bundle stats omit them.
+
+Source quarantines and destination-adjacent restore stages are intentionally outside the vault and are not enumerated or counted by stats. Preserve them when a crash or recovery failure leaves them behind; SessionCrate does not automatically scavenge or delete them.

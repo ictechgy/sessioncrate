@@ -182,6 +182,11 @@ def _iter_readable(vault_dir: Path, manifest: dict) -> Iterator[tuple[int, str, 
                 raise VaultError(f"archive {archive_id} contains invalid JSON at line {line_number}") from error
             except RecursionError as error:
                 raise VaultError(f"archive {archive_id} contains deeply nested JSON at line {line_number}") from error
+            except ValueError:
+                # Decoder limits (for example integer digit bounds) make this
+                # record unsupported; they do not indicate corrupt gzip bytes.
+                yield line_number, None, None
+                continue
             try:
                 readable = _readable_record(record)
             except RecursionError as error:

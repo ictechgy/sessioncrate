@@ -124,6 +124,34 @@ def _bundle_root(vault_dir: Path | str, *, create: bool) -> Path | None:
     return path
 
 
+def _temporary_file_stats(directory: Path | None, prefix: str) -> tuple[int, int, int]:
+    """Measure unfinished bundle files without following symlinks."""
+
+    if directory is None:
+        return 0, 0, 0
+    count = 0
+    logical_bytes = 0
+    allocated_bytes = 0
+    try:
+        entries = os.scandir(directory)
+    except OSError:
+        return 0, 0, 0
+    with entries:
+        for entry in entries:
+            if not entry.name.startswith(prefix):
+                continue
+            try:
+                item = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if not stat.S_ISREG(item.st_mode):
+                continue
+            count += 1
+            logical_bytes += int(item.st_size)
+            allocated_bytes += int(getattr(item, "st_blocks", 0)) * 512
+    return count, logical_bytes, allocated_bytes
+
+
 def _manifest_path(bundle_root: Path, archive_id: str) -> Path:
     if not isinstance(archive_id, str) or len(archive_id) != _ARCHIVE_ID_LEN or set(archive_id) - _HEX64:
         raise VaultError("bundle archive id is invalid")
@@ -390,10 +418,12 @@ def _read_manifest(path: Path, *, expected_id: str | None = None) -> dict[str, A
                 os.close(fd)
         if len(encoded) > _MAX_MANIFEST_BYTES:
             raise VaultError("bundle manifest exceeds maximum size")
-        raw = json.loads(encoded.decode("utf-8"))
+        raw = json.loads(
+            encoded.decode("utf-8"), parse_int=storage._bounded_json_int
+        )
     except VaultError:
         raise
-    except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as exc:
+    except (OSError, UnicodeError, ValueError, RecursionError) as exc:
         raise VaultError("bundle manifest is invalid JSON") from exc
     return _validate_manifest(raw, expected_id=expected_id)
 
@@ -600,6 +630,7 @@ def _snapshot_bundle(
     temp_fd, temp_name = tempfile.mkstemp(prefix=".bundle-", dir=blobs_dir)
     temp = Path(temp_name)
     metadata_prefix = b""
+    metadata_prefix_captured = False
     file_entries: list[dict[str, Any]] = []
     try:
         os.fchmod(temp_fd, _PRIVATE_FILE)
@@ -616,8 +647,9 @@ def _snapshot_bundle(
                                 fd = -1
                                 reader = _HashingReader(stream)
                                 archive.addfile(_tar_info(relative, before), reader)
-                                if not metadata_prefix:
+                                if not metadata_prefix_captured:
                                     metadata_prefix = bytes(reader.prefix)
+                                    metadata_prefix_captured = True
                             after = storage._safe_regular(path, label="bundle source file")
                             if _identity_stat(after) != _identity_stat(before) or reader.total != before.st_size:
                                 raise VaultError(f"source changed while snapshotting: {relative}")
@@ -891,7 +923,7 @@ def archive(
     remove_originals: bool = False,
 ) -> dict[str, Any]:
     candidates = _group_candidates(tool, source_root, older_than_days)
-    result: dict[str, Any] = {"execute": bool(execute), "executed": bool(execute), "candidates": [{key: value for key, value in item.items() if key != "_group"} for item in candidates], "archived": [], "removed": [], "skipped": [], "removed_source_bytes": 0}
+    result: dict[str, Any] = {"execute": bool(execute), "executed": bool(execute), "candidates": [{key: value for key, value in item.items() if key != "_group"} for item in candidates], "archived": [], "removed": [], "skipped": [], "errors": [], "removed_source_bytes": 0}
     if not execute:
         return result
     selected = [item for item in candidates if item["eligible"]]
@@ -945,7 +977,7 @@ def archive(
             except (VaultError, OSError) as exc:
                 if publication_started:
                     raise
-                result["skipped"].append(
+                result["errors"].append(
                     {
                         "tool": candidate["tool"],
                         "session_id": candidate["session_id"],
@@ -1128,20 +1160,22 @@ def _restore_native_preflight(
     return equal
 
 
-def _mkdir_restore_directory(path: Path, mode: int) -> None:
+def _mkdir_restore_directory(path: Path, mode: int) -> bool:
     existing = _lstat(path)
     if existing is not None:
         if stat.S_ISLNK(existing.st_mode) or not stat.S_ISDIR(existing.st_mode):
             raise VaultError(f"destination directory is unsafe: {path}")
-        return
+        return False
     parent = path.parent
     _mkdir_restore_directory(parent, _PRIVATE_DIR)
     try:
         os.mkdir(path, mode & 0o1777)
+        return True
     except FileExistsError:
         existing = _lstat(path)
         if existing is None or stat.S_ISLNK(existing.st_mode) or not stat.S_ISDIR(existing.st_mode):
             raise VaultError(f"destination directory is unsafe: {path}")
+        return False
 
 
 def _cleanup_restore_stage(stage: Path, manifest: dict[str, Any]) -> None:
@@ -1213,6 +1247,21 @@ def _cleanup_restore_outputs(
     published_files: list[tuple[Path, tuple[int, int, int, int, int, int]]],
     created_directories: list[dict[str, Any]],
 ) -> None:
+    owned_directories: list[dict[str, Any]] = []
+    for directory in sorted(
+        created_directories,
+        key=lambda item: len(PurePosixPath(item["relative_path"]).parts),
+    ):
+        target = directory["target"]
+        try:
+            fd = _open_restore_directory(target, directory["identity"])
+            try:
+                os.fchmod(fd, _PRIVATE_DIR)
+            finally:
+                os.close(fd)
+        except (VaultError, OSError):
+            continue
+        owned_directories.append(directory)
     for target, identity in reversed(published_files):
         current = _lstat(target)
         if current is not None and stat.S_ISREG(current.st_mode) and not stat.S_ISLNK(current.st_mode) and _identity_stat(current) == identity:
@@ -1220,16 +1269,8 @@ def _cleanup_restore_outputs(
                 os.unlink(target)
             except OSError:
                 pass
-    for directory in sorted(created_directories, key=lambda item: len(PurePosixPath(item["relative_path"]).parts), reverse=True):
+    for directory in sorted(owned_directories, key=lambda item: len(PurePosixPath(item["relative_path"]).parts), reverse=True):
         target = directory["target"]
-        try:
-            fd = _open_restore_directory(target, directory["identity"])
-        except VaultError:
-            continue
-        try:
-            os.fchmod(fd, _PRIVATE_DIR)
-        finally:
-            os.close(fd)
         current = _lstat(target)
         if current is None or stat.S_ISLNK(current.st_mode) or not stat.S_ISDIR(current.st_mode) or (current.st_dev, current.st_ino) != directory["identity"]:
             continue
@@ -1293,15 +1334,20 @@ def restore(vault_dir: Path, archive_id: str, destination_home: Path | None = No
             equal = _restore_preflight(root, manifest, trusted_files)
             result["skipped"] = list(equal)
             storage._mkdir_private(root, tighten_existing=False)
+            observed_unowned_directory = False
             for directory in sorted(manifest["directories"], key=lambda item: len(PurePosixPath(item["path"]).parts)):
                 target_directory = root.joinpath(*PurePosixPath(directory["path"]).parts)
-                before = _lstat(target_directory)
-                _mkdir_restore_directory(target_directory, _PRIVATE_DIR)
-                if before is None:
+                created = _mkdir_restore_directory(target_directory, _PRIVATE_DIR)
+                if created:
                     created_stat = _lstat(target_directory)
                     if created_stat is None or not stat.S_ISDIR(created_stat.st_mode) or stat.S_ISLNK(created_stat.st_mode):
                         raise VaultError(f"restored directory is unsafe: {directory['path']}")
                     created_directories.append({"target": target_directory, "relative_path": directory["path"], "mode": directory["mode"], "mtime_ns": directory["mtime_ns"], "identity": (created_stat.st_dev, created_stat.st_ino)})
+                else:
+                    observed_unowned_directory = True
+            if observed_unowned_directory:
+                equal = _restore_preflight(root, manifest, trusted_files)
+                result["skipped"] = list(equal)
             for entry in manifest["files"]:
                 if entry["path"] in equal:
                     continue
@@ -1401,11 +1447,44 @@ def _current_source_layout(root: Path, manifest: dict[str, Any]) -> tuple[set[st
     return actual_files, actual_directories
 
 
-def _verify_current_source(
+def _verify_current_source_metadata(
     manifest: dict[str, Any],
 ) -> tuple[Path, list[Path], list[os.stat_result]]:
     root = storage._require_directory(Path(manifest["source_root"]), label="bundle source root")
     _current_source_layout(root, manifest)
+    current_stats: list[os.stat_result] = []
+    for item in manifest["files"]:
+        path = root.joinpath(*PurePosixPath(item["path"]).parts)
+        current = storage._safe_regular(path, label="bundle source file")
+        if (
+            current.st_size != item["size"]
+            or stat.S_IMODE(current.st_mode) != item["mode"]
+            or current.st_mtime_ns != item["mtime_ns"]
+        ):
+            raise VaultError(f"source changed since archive: {item['path']}")
+        current_stats.append(current)
+    for item in manifest["directories"]:
+        path = root.joinpath(*PurePosixPath(item["path"]).parts)
+        current = _lstat(path)
+        if (
+            current is None
+            or stat.S_ISLNK(current.st_mode)
+            or not stat.S_ISDIR(current.st_mode)
+            or stat.S_IMODE(current.st_mode) != item["mode"]
+            or current.st_mtime_ns != item["mtime_ns"]
+        ):
+            raise VaultError(f"source changed since archive: {item['path']}")
+        # Directory mtimes are part of the source group's snapshot. Keep them
+        # in the same age barrier as files so a newly-created empty or nested
+        # companion cannot be pruned immediately after archiving.
+        current_stats.append(current)
+    return root, _group_root_paths(root, manifest), current_stats
+
+
+def _verify_current_source(
+    manifest: dict[str, Any],
+) -> tuple[Path, list[Path], list[os.stat_result]]:
+    root, root_paths, _metadata_stats = _verify_current_source_metadata(manifest)
     current_stats: list[os.stat_result] = []
     for item in manifest["files"]:
         path = root.joinpath(*PurePosixPath(item["path"]).parts)
@@ -1432,11 +1511,8 @@ def _verify_current_source(
             or current.st_mtime_ns != item["mtime_ns"]
         ):
             raise VaultError(f"source changed since archive: {item['path']}")
-        # Directory mtimes are part of the source group's snapshot. Keep them
-        # in the same age barrier as files so a newly-created empty or nested
-        # companion cannot be pruned immediately after archiving.
         current_stats.append(current)
-    return root, _group_root_paths(root, manifest), current_stats
+    return root, root_paths, current_stats
 
 
 def _activity_for_paths(paths: list[Path]) -> tuple[str, str]:
@@ -1828,6 +1904,15 @@ def prune(vault_dir: Path, archive_id: str | None = None, execute: bool = False,
         manifests = [_resolve(bundle_root, archive_id)] if archive_id else [item for item in _iter_manifests(bundle_root) if tool is None or item["tool"] == tool]
         candidates: list[dict[str, Any]] = []
         for manifest in manifests:
+            try:
+                _root, _root_paths, current_stats = _verify_current_source_metadata(manifest)
+                recent = any(time.time_ns() - item.st_mtime_ns < _HOUR_NS for item in current_stats)
+                if recent:
+                    candidates.append({"archive_id": manifest["archive_id"], "eligible": False, "activity": "inactive", "reason": "source is less than one hour old"})
+                    continue
+            except VaultError as exc:
+                candidates.append({"archive_id": manifest["archive_id"], "eligible": False, "reason": str(exc)})
+                continue
             check = _verify_blob(bundle_root, manifest)
             if not check["ok"]:
                 candidates.append({"archive_id": manifest["archive_id"], "eligible": False, "reason": check["error"]})
@@ -1948,6 +2033,9 @@ def stats(vault_dir: Path, tool: str | None = None) -> dict[str, Any]:
         "bundle_source_bytes_retained": 0,
         "bundle_net_storage_bytes": 0,
         "bundle_allocated_bytes": 0,
+        "bundle_temporary_files": 0,
+        "bundle_temporary_bytes": 0,
+        "bundle_temporary_allocated_bytes": 0,
     }
     vault = storage._safe_vault(vault_dir, create=False)
     if vault is None:
@@ -1967,14 +2055,23 @@ def stats(vault_dir: Path, tool: str | None = None) -> dict[str, Any]:
                 blob_stats.append(storage._safe_regular(vault / relative, label="bundle blob"))
         else:
             for entry in os.scandir(bundle_root / "blobs"):
-                if not entry.name.endswith(".tar.gz"):
+                if entry.name.startswith(".bundle-") or not entry.name.endswith(".tar.gz"):
                     continue
                 entry_stat = entry.stat(follow_symlinks=False)
                 if stat.S_ISREG(entry_stat.st_mode) and not stat.S_ISLNK(entry_stat.st_mode):
                     blob_stats.append(entry_stat)
+        temporary_files = 0
+        temporary_bytes = 0
+        temporary_allocated_bytes = 0
+        if tool is None:
+            blob_temporary = _temporary_file_stats(bundle_root / "blobs", ".bundle-")
+            manifest_temporary = _temporary_file_stats(bundle_root / "manifests", ".bundle-manifest-")
+            temporary_files = blob_temporary[0] + manifest_temporary[0]
+            temporary_bytes = blob_temporary[1] + manifest_temporary[1]
+            temporary_allocated_bytes = blob_temporary[2] + manifest_temporary[2]
         manifest_bytes = sum(item.st_size for item in manifest_stats)
         blob_bytes = sum(item.st_size for item in blob_stats)
-        vault_bytes = manifest_bytes + blob_bytes
+        vault_bytes = manifest_bytes + blob_bytes + temporary_bytes
         retained_source_bytes = 0
         retained_paths: set[tuple[str, str]] = set()
         for manifest in manifests:
@@ -2002,7 +2099,10 @@ def stats(vault_dir: Path, tool: str | None = None) -> dict[str, Any]:
             "bundle_raw_bytes": sum(item["raw_bytes"] for item in manifests),
             "bundle_source_bytes_retained": retained_source_bytes,
             "bundle_net_storage_bytes": vault_bytes + retained_source_bytes,
-            "bundle_allocated_bytes": allocated,
+            "bundle_allocated_bytes": allocated + temporary_allocated_bytes,
+            "bundle_temporary_files": temporary_files,
+            "bundle_temporary_bytes": temporary_bytes,
+            "bundle_temporary_allocated_bytes": temporary_allocated_bytes,
         }
 
 

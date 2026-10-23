@@ -132,6 +132,59 @@ class BundleTests(unittest.TestCase):
         for relative, data in files.items():
             self.assertEqual((restored / relative).read_bytes(), data)
 
+    def test_empty_main_file_does_not_take_metadata_from_companion(self) -> None:
+        files = {
+            "projects/demo/session-empty.jsonl": b"",
+            "projects/demo/session-empty/worker.jsonl": (
+                b'{"cwd":"/companion/cwd","version":"companion-version"}\n'
+            ),
+        }
+        group = self._group(
+            "claude",
+            "session-empty",
+            files,
+            formats={path: "claude-jsonl" for path in files},
+            root_entries=("projects/demo/session-empty.jsonl", "projects/demo/session-empty"),
+        )
+        group.cwd = "/group/cwd"
+
+        manifest = bundles.archive(
+            "claude", self.source, self.vault, older_than_days=1, execute=True
+        )["archived"][0]
+
+        self.assertEqual(manifest["cwd"], "/group/cwd")
+        self.assertEqual(manifest["tool_version"], "")
+
+    def test_archive_snapshot_error_is_reported_and_batch_continues(self) -> None:
+        for session_id in ("snapshot-fails", "snapshot-healthy"):
+            relative = f"projects/demo/{session_id}.jsonl"
+            self._group(
+                "claude",
+                session_id,
+                {relative: f"{session_id}\n".encode()},
+                formats={relative: "text"},
+            )
+        real_snapshot = bundles._snapshot_bundle
+
+        def fail_selected(root: Path, group: object, blobs_dir: Path) -> object:
+            if getattr(group, "session_id") == "snapshot-fails":
+                raise VaultError("synthetic snapshot failure")
+            return real_snapshot(root, group, blobs_dir)
+
+        with mock.patch.object(bundles, "_snapshot_bundle", side_effect=fail_selected):
+            result = bundles.archive(
+                "claude", self.source, self.vault, older_than_days=1, execute=True
+            )
+
+        self.assertEqual(
+            [item["session_id"] for item in result["archived"]],
+            ["snapshot-healthy"],
+        )
+        self.assertEqual(result["skipped"], [])
+        self.assertEqual(len(result["errors"]), 1)
+        self.assertEqual(result["errors"][0]["session_id"], "snapshot-fails")
+        self.assertIn("snapshot failure", result["errors"][0]["reason"])
+
     def test_glm_and_agy_exports_are_explicit_and_tagged(self) -> None:
         glm = self._group(
             "glm",
@@ -740,9 +793,9 @@ class BundleTests(unittest.TestCase):
         with mock.patch.object(bundles, "_capture_directories", side_effect=mutate_during_final_walk):
             result = bundles.archive("grok", self.source, self.vault, older_than_days=1, execute=True)
         self.assertEqual(bundles.list_archives(self.vault), [])
-        self.assertIn("source changed", result["skipped"][0]["reason"])
+        self.assertIn("source changed", result["errors"][0]["reason"])
 
-    def test_archive_skips_one_group_failure_and_continues_batch(self) -> None:
+    def test_archive_reports_one_group_failure_and_continues_batch(self) -> None:
         self._group("agy", "broken", {"export/broken.txt": b"broken\n"}, formats={"export/broken.txt": "text"}, source_mode="export")
         self._group("agy", "healthy", {"export/healthy.txt": b"healthy\n"}, formats={"export/healthy.txt": "text"}, source_mode="export")
         real_snapshot = bundles._snapshot_bundle
@@ -756,8 +809,8 @@ class BundleTests(unittest.TestCase):
             result = bundles.archive("agy", self.source, self.vault, older_than_days=1, execute=True)
 
         self.assertEqual([item["session_id"] for item in result["archived"]], ["healthy"])
-        self.assertEqual(result["skipped"][0]["session_id"], "broken")
-        self.assertIn("synthetic changed group", result["skipped"][0]["reason"])
+        self.assertEqual(result["errors"][0]["session_id"], "broken")
+        self.assertIn("synthetic changed group", result["errors"][0]["reason"])
 
     def test_native_restore_rechecks_for_new_descendants_after_staging(self) -> None:
         files = {
@@ -1032,6 +1085,35 @@ class BundleTests(unittest.TestCase):
         rename.assert_not_called()
         self.assertEqual((self.source / relative).read_bytes(), b"first\nresumed\n")
 
+    def test_prune_skips_blob_decompression_for_missing_or_stale_sources(self) -> None:
+        missing_relative = "projects/demo/session-missing.jsonl"
+        stale_relative = "projects/demo/session-stale.jsonl"
+        self._group(
+            "claude",
+            "session-missing",
+            {missing_relative: b"missing\n"},
+            formats={missing_relative: "text"},
+        )
+        self._group(
+            "claude",
+            "session-stale",
+            {stale_relative: b"stale\n"},
+            formats={stale_relative: "text"},
+        )
+        bundles.archive("claude", self.source, self.vault, older_than_days=1, execute=True)
+        (self.source / missing_relative).unlink()
+        os.chmod(self.source / stale_relative, 0o600)
+
+        with mock.patch.object(bundles, "_verify_blob", wraps=bundles._verify_blob) as verify_blob:
+            result = bundles.prune(self.vault, execute=False, tool="claude")
+
+        self.assertEqual(verify_blob.call_count, 0)
+        self.assertEqual(len(result["candidates"]), 2)
+        self.assertTrue(all(not item["eligible"] for item in result["candidates"]))
+        self.assertTrue(
+            all("source changed" in item["reason"] for item in result["candidates"])
+        )
+
     def test_historical_manifest_is_skipped_while_current_version_prunes(self) -> None:
         relative = "projects/demo/session-q.jsonl"
         source = self.source / relative
@@ -1263,6 +1345,121 @@ class BundleTests(unittest.TestCase):
         self.assertEqual((restored / "worker.txt").read_bytes(), b"worker\n")
         self.assertEqual(stat.S_IMODE(restored.stat().st_mode), 0o500)
 
+    def test_restore_failure_cleanup_relaxes_owned_readonly_directory_first(self) -> None:
+        directory = self.root / "cleanup-readonly"
+        directory.mkdir(mode=0o700)
+        published = directory / "published.txt"
+        published.write_bytes(b"published\n")
+        published_identity = bundles._identity_stat(published.stat())
+        directory_stat = directory.stat()
+        os.chmod(directory, 0o500)
+
+        bundles._cleanup_restore_outputs(
+            [(published, published_identity)],
+            [
+                {
+                    "target": directory,
+                    "relative_path": "cleanup-readonly",
+                    "mode": 0o500,
+                    "mtime_ns": directory_stat.st_mtime_ns,
+                    "identity": (directory_stat.st_dev, directory_stat.st_ino),
+                }
+            ],
+        )
+
+        self.assertFalse(directory.exists())
+
+    def test_restore_directory_creation_race_preserves_foreign_metadata_on_success(self) -> None:
+        main_relative = "projects/demo/session-raced.jsonl"
+        relative = "projects/demo/session-raced/worker.txt"
+        payload = b"worker\n"
+        self._group(
+            "claude",
+            "session-raced",
+            {main_relative: b"main\n", relative: payload},
+            formats={main_relative: "text", relative: "text"},
+            root_entries=(main_relative, "projects/demo/session-raced"),
+        )
+        manifest = bundles.archive(
+            "claude", self.source, self.vault, older_than_days=1, execute=True
+        )["archived"][0]
+        destination = self.root / "restore-raced-success"
+        raced_directory = destination / "projects/demo/session-raced"
+        raced_file = raced_directory / "worker.txt"
+        foreign_mtime = time.time_ns() - 7 * 86_400 * 1_000_000_000
+        real_mkdir = bundles.os.mkdir
+        injected = False
+
+        def race_mkdir(path: Path | str, mode: int = 0o777, *args: object, **kwargs: object) -> None:
+            nonlocal injected
+            target = Path(path)
+            if target == raced_directory and not injected:
+                real_mkdir(path, 0o700, *args, **kwargs)
+                raced_file.write_bytes(payload)
+                os.chmod(raced_directory, 0o711)
+                os.utime(raced_directory, ns=(foreign_mtime, foreign_mtime))
+                injected = True
+            real_mkdir(path, mode, *args, **kwargs)
+
+        with mock.patch.object(bundles.os, "mkdir", side_effect=race_mkdir):
+            result = bundles.restore(
+                self.vault, manifest["archive_id"], destination, execute=True
+            )
+
+        raced_stat = raced_directory.stat()
+        self.assertTrue(injected)
+        self.assertEqual(result["restored"], [main_relative])
+        self.assertEqual(result["skipped"], [relative])
+        self.assertEqual(stat.S_IMODE(raced_stat.st_mode), 0o711)
+        self.assertEqual(raced_stat.st_mtime_ns, foreign_mtime)
+        self.assertEqual(raced_file.read_bytes(), payload)
+
+    def test_restore_directory_creation_race_preserves_foreign_directory_on_failure(self) -> None:
+        main_relative = "projects/demo/session-raced-failure.jsonl"
+        relative = "projects/demo/session-raced-failure/worker.txt"
+        self._group(
+            "claude",
+            "session-raced-failure",
+            {main_relative: b"main\n", relative: b"worker\n"},
+            formats={main_relative: "text", relative: "text"},
+            root_entries=(main_relative, "projects/demo/session-raced-failure"),
+        )
+        manifest = bundles.archive(
+            "claude", self.source, self.vault, older_than_days=1, execute=True
+        )["archived"][0]
+        destination = self.root / "restore-raced-failure"
+        raced_directory = destination / "projects/demo/session-raced-failure"
+        sentinel = raced_directory / "foreign.txt"
+        foreign_mtime = time.time_ns() - 8 * 86_400 * 1_000_000_000
+        real_mkdir = bundles.os.mkdir
+        injected = False
+
+        def race_mkdir(path: Path | str, mode: int = 0o777, *args: object, **kwargs: object) -> None:
+            nonlocal injected
+            target = Path(path)
+            if target == raced_directory and not injected:
+                real_mkdir(path, 0o700, *args, **kwargs)
+                sentinel.write_bytes(b"foreign\n")
+                os.chmod(raced_directory, 0o711)
+                os.utime(raced_directory, ns=(foreign_mtime, foreign_mtime))
+                injected = True
+            real_mkdir(path, mode, *args, **kwargs)
+
+        with mock.patch.object(bundles.os, "mkdir", side_effect=race_mkdir), mock.patch.object(
+            bundles, "_copy_verified_stage", side_effect=OSError("synthetic restore failure")
+        ) as copy_stage:
+            with self.assertRaises(VaultError):
+                bundles.restore(
+                    self.vault, manifest["archive_id"], destination, execute=True
+                )
+
+        raced_stat = raced_directory.stat()
+        self.assertTrue(injected)
+        self.assertEqual(stat.S_IMODE(raced_stat.st_mode), 0o711)
+        self.assertEqual(raced_stat.st_mtime_ns, foreign_mtime)
+        self.assertEqual(sentinel.read_bytes(), b"foreign\n")
+        copy_stage.assert_not_called()
+
     def test_restore_write_only_file_keeps_temp_readable_until_publish(self) -> None:
         relative = "export/write-only.txt"
         self._group("agy", "write-only", {relative: b"payload\n"}, formats={relative: "text"}, source_mode="export")
@@ -1431,6 +1628,32 @@ class BundleTests(unittest.TestCase):
         empty_vault.mkdir()
         self.assertEqual(bundles.verify(empty_vault), {"ok": True, "verified": [], "failed": [], "count": 0})
 
+    def test_manifest_integer_parser_has_portable_limit_without_echoing_payload(self) -> None:
+        manifest_path = self.root / "bounded-integer.json"
+        accepted = "9" * 20
+        manifest_path.write_text(f'{{"value":{accepted}}}', encoding="utf-8")
+        with mock.patch.object(
+            bundles, "_validate_manifest", side_effect=lambda raw, **_kwargs: raw
+        ):
+            parsed = bundles._read_manifest(manifest_path)
+        self.assertEqual(parsed["value"], int(accepted))
+
+        private_marker = "private-manifest-marker"
+        for digit_count in (21, 5_000):
+            digits = "9" * digit_count
+            manifest_path.write_text(
+                f'{{"value":{digits},"private":"{private_marker}"}}',
+                encoding="utf-8",
+            )
+            with self.subTest(digit_count=digit_count):
+                with self.assertRaisesRegex(
+                    VaultError, "^bundle manifest is invalid JSON$"
+                ) as raised:
+                    bundles._read_manifest(manifest_path)
+                self.assertIsInstance(raised.exception.__cause__, ValueError)
+                self.assertNotIn(private_marker, str(raised.exception))
+                self.assertNotIn(digits, str(raised.exception))
+
     def test_stats_include_retained_sources_and_net_storage(self) -> None:
         relative = "export/stats.txt"
         payload = b"retained source\n"
@@ -1442,6 +1665,40 @@ class BundleTests(unittest.TestCase):
         self.assertEqual(result["bundle_source_bytes_retained"], len(payload))
         self.assertEqual(result["bundle_net_storage_bytes"], result["bundle_vault_bytes"] + len(payload))
         self.assertGreater(result["bundle_allocated_bytes"], 0)
+
+    def test_stats_include_unfiltered_bundle_temps_but_exclude_them_from_tool_view(self) -> None:
+        relative = "export/stats-temp.txt"
+        payload = b"retained source\n"
+        self._group("agy", "stats-temp", {relative: payload}, formats={relative: "text"}, source_mode="export")
+        bundles.archive("agy", self.source, self.vault, older_than_days=1, execute=True)
+        blobs = self.vault / "bundles/blobs"
+        manifests = self.vault / "bundles/manifests"
+        blob_temp = blobs / ".bundle-incomplete.tar.gz"
+        manifest_temp = manifests / ".bundle-manifest-incomplete.json"
+        blob_temp.write_bytes(b"blob temp")
+        manifest_temp.write_bytes(b"manifest temp")
+        outside = self.root / "bundle-stats-outside"
+        outside.write_bytes(b"must not be counted")
+        (blobs / ".bundle-link").symlink_to(outside)
+        (manifests / ".bundle-manifest-link").symlink_to(outside)
+
+        result = bundles.stats(self.vault)
+        filtered = bundles.stats(self.vault, tool="agy")
+
+        self.assertEqual(result["bundle_temporary_files"], 2)
+        self.assertEqual(result["bundle_temporary_bytes"], blob_temp.stat().st_size + manifest_temp.stat().st_size)
+        self.assertGreater(result["bundle_temporary_allocated_bytes"], 0)
+        self.assertEqual(result["bundle_archives"], 1)
+        self.assertEqual(result["bundle_blobs"], 1)
+        self.assertEqual(
+            result["bundle_vault_bytes"],
+            result["bundle_blob_bytes"] + result["bundle_manifest_bytes"] + result["bundle_temporary_bytes"],
+        )
+        self.assertEqual(filtered["bundle_temporary_files"], 0)
+        self.assertEqual(filtered["bundle_temporary_bytes"], 0)
+        self.assertEqual(filtered["bundle_temporary_allocated_bytes"], 0)
+        self.assertEqual(filtered["bundle_vault_bytes"], result["bundle_vault_bytes"] - result["bundle_temporary_bytes"])
+        self.assertTrue(outside.exists())
 
     def test_diagnostic_manifest_cannot_expand_log_scope_or_use_generic_reader(self) -> None:
         relative = "model-io-sess-boundary.jsonl"

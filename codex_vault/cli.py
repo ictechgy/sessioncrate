@@ -125,7 +125,11 @@ def _print_human(result):
         rows = result['archives']
         for item in rows:
             if isinstance(item, dict):
-                print(f"[{_clean(item.get('tool', 'codex'))}] {str(item.get('archive_id', ''))[:12]}  {_size(item.get('raw_bytes', 0))} -> "
+                archive_id = str(item.get('archive_id', ''))
+                # Prefix resolution cannot prove uniqueness across an unreadable
+                # namespace. Keep intact archives addressable from this output.
+                display_id = archive_id if result.get('errors') else archive_id[:12]
+                print(f"[{_clean(item.get('tool', 'codex'))}] {display_id}  {_size(item.get('raw_bytes', 0))} -> "
                       f"{_size(item.get('compressed_bytes', 0))}  {_clean(item.get('cwd', ''))}")
         if not rows:
             print('No archives. Run archive --execute to create one.')
@@ -211,7 +215,7 @@ def _resolve_backend(vault, archive_id, selected_tool=None):
         raise VaultError('archive id must be a hexadecimal id or unique prefix')
     matches, errors = _archive_catalog(vault, selected_tool, prefix=archive_id)
     if errors and (len(archive_id) != 64 or any(item.get('archive_id') == archive_id for item in errors) or not matches):
-        raise VaultError('matching manifest is damaged; verify the vault and use the full id of an intact archive')
+        raise VaultError('archive scope could not be fully inspected; verify the vault, use the full id of an intact archive, or narrow --tool')
     if not matches:
         raise VaultError('archive was not found')
     if len(matches) != 1:
@@ -234,12 +238,18 @@ def _run(args, vault):
             raise storage.VaultError('choose --source-root or --codex-home, not both')
         if tool != 'codex' and args.codex_home is not None:
             raise storage.VaultError('--codex-home is only for Codex; use --source-root for other tools')
-        source = args.source_root or args.codex_home or sources.default_source_root(tool)
+        try:
+            source = args.source_root or args.codex_home or sources.default_source_root(tool)
+            if source is not None:
+                source = source.expanduser().absolute()
+        except storage.VaultError:
+            raise
+        except RuntimeError as error:
+            raise storage.VaultError('source home could not be expanded') from error
         if source is None:
             if tool in ('zcode', 'autoclaw'):
                 raise storage.VaultError(f'{tool} requires --source-root with a dedicated model-io diagnostic log directory')
             raise storage.VaultError(f'{tool} requires --source-root with explicit session exports; native databases are not selected')
-        source = source.expanduser().absolute()
         if tool == 'codex':
             if command == 'scan':
                 return storage.scan(source, older_than_days=args.older_than)
@@ -280,6 +290,9 @@ def _run(args, vault):
                 ('blob_bytes', 'bundle_blob_bytes'), ('compressed_bytes', 'bundle_blob_bytes'),
                 ('manifest_bytes', 'bundle_manifest_bytes'), ('vault_bytes', 'bundle_vault_bytes'),
                 ('allocated_bytes', 'bundle_allocated_bytes'),
+                ('temporary_files', 'bundle_temporary_files'),
+                ('temporary_bytes', 'bundle_temporary_bytes'),
+                ('temporary_allocated_bytes', 'bundle_temporary_allocated_bytes'),
                 ('source_bytes_retained', 'bundle_source_bytes_retained'),
                 ('retained_source_bytes', 'bundle_source_bytes_retained')):
             result[key] = legacy.get(key, 0) + grouped.get(bundle_key, 0)
@@ -370,7 +383,10 @@ def main(argv=None, *, program_name=None):
         if hasattr(args, 'limit') and not 1 <= args.limit <= 1000:
             raise storage.VaultError('--limit must be between 1 and 1000')
         data_home = Path(os.environ.get('XDG_DATA_HOME', str(Path.home() / '.local/share')))
-        vault = (args.vault or data_home / 'codex-vault').expanduser()
+        try:
+            vault = (args.vault or data_home / 'codex-vault').expanduser()
+        except RuntimeError as error:
+            raise storage.VaultError('vault home could not be expanded') from error
         result = _run(args, vault)
         if args.json:
             print(json.dumps(result, ensure_ascii=False, sort_keys=True))

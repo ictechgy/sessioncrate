@@ -210,7 +210,7 @@ def _iter_readable(vault_dir: Path, manifest: dict) -> Iterator[tuple[int, str, 
         raise VaultError(f"archive {archive_id} has corrupt gzip data") from error
 
 
-def _casefold_span(text: str, query: str) -> tuple[int, int] | None:
+def _casefold_span(text: str, query: str, *, folded_query: str | None = None) -> tuple[int, int] | None:
     """Return the original-text span of a literal case-insensitive match.
 
     Unicode casefolding can expand one character into several characters (for
@@ -218,7 +218,8 @@ def _casefold_span(text: str, query: str) -> tuple[int, int] | None:
     the matching offsets are then mapped back with a single pass over the
     original text, avoiding per-character offset lists.
     """
-    folded_query = query.casefold()
+    if folded_query is None:
+        folded_query = query.casefold()
     position = text.casefold().find(folded_query)
     if position < 0:
         return None
@@ -247,8 +248,8 @@ def _casefold_span(text: str, query: str) -> tuple[int, int] | None:
     return start, end if end is not None else len(text)
 
 
-def _match_context(text: str, query: str) -> str:
-    span = _casefold_span(text, query)
+def _match_context(text: str, query: str, *, folded_query: str | None = None) -> str:
+    span = _casefold_span(text, query, folded_query=folded_query)
     if span is None:
         return ""
     start, end = span
@@ -300,6 +301,7 @@ def search(
         raise VaultError("query must not be blank")
     if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
         raise VaultError("limit must be greater than zero")
+    folded_query = query.casefold()
     matches: list[dict] = []
     scanned_archives = 0
     skipped_records = 0
@@ -316,7 +318,7 @@ def search(
             if kind is None:
                 skipped_records += 1
                 continue
-            if query.casefold() not in text.casefold():
+            if folded_query not in text.casefold():
                 continue
             if len(matches) >= limit:
                 truncated = True
@@ -332,7 +334,7 @@ def search(
                     "cwd": str(manifest.get("cwd", "")),
                     "line": line_number,
                     "kind": kind,
-                    "snippet": _match_context(text, query),
+                    "snippet": _match_context(text, query, folded_query=folded_query),
                 }
             )
         if truncated:
@@ -352,6 +354,7 @@ def show(vault_dir: Path, archive_id: str, limit: int = 100, query: str | None =
         raise VaultError("limit must be greater than zero")
     if query is not None and (not isinstance(query, str) or not query.strip()):
         raise VaultError("query must not be blank")
+    folded_query = query.casefold() if query is not None else None
     try:
         manifest = resolve_archive(Path(vault_dir), archive_id)
     except VaultError:
@@ -365,7 +368,7 @@ def show(vault_dir: Path, archive_id: str, limit: int = 100, query: str | None =
         if kind is None:
             skipped_records += 1
             continue
-        if query is not None and query.casefold() not in text.casefold():
+        if folded_query is not None and folded_query not in text.casefold():
             continue
         if len(records) >= limit:
             truncated = True

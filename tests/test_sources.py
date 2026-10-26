@@ -279,7 +279,7 @@ class SourceAdapterTests(unittest.TestCase):
             blocked_codex = codex_scope / "blocked"
             blocked_codex.mkdir(parents=True)
             (codex_scope / "a.db").write_bytes(b"SQLite format 3\x00")
-            (codex_scope / "healthy.jsonl").write_text('{}\n', encoding="utf-8")
+            (codex_scope / "rollout-healthy.jsonl").write_text('{}\n', encoding="utf-8")
 
             export_root = base / "exports"
             blocked_export = export_root / "blocked"
@@ -299,7 +299,7 @@ class SourceAdapterTests(unittest.TestCase):
                 codex_groups = discover("codex", codex_root)
                 export_groups = discover("export", export_root)
 
-            codex_healthy = next(group for group in codex_groups if group.files == ("sessions/project/healthy.jsonl",))
+            codex_healthy = next(group for group in codex_groups if group.files == ("sessions/project/rollout-healthy.jsonl",))
             self.assertTrue(codex_healthy.removable)
             self.assertFalse(codex_healthy.notes)
             codex_warning = next(group for group in codex_groups if not group.root_entries)
@@ -312,6 +312,30 @@ class SourceAdapterTests(unittest.TestCase):
             export_warning = next(group for group in export_groups if not group.root_entries)
             self.assertFalse(export_warning.removable)
             self.assertTrue(any("unreadable directory" in note for note in export_warning.notes))
+
+    def test_codex_discovery_matches_legacy_rollout_scope(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "codex"
+            sessions = root / "sessions" / "project"
+            archived = root / "archived_sessions" / "old"
+            sessions.mkdir(parents=True)
+            archived.mkdir(parents=True)
+            (sessions / "rollout-plain.jsonl").write_bytes(b"synthetic\n")
+            (sessions / "rollout-compressed.jsonl.zst").write_bytes(b"synthetic zstd bytes")
+            (sessions / "notes.jsonl").write_bytes(b"outside rollout scope\n")
+            (sessions / "rollout-not-jsonl.txt").write_bytes(b"outside rollout scope\n")
+            (archived / "rollout-old.jsonl").write_bytes(b"synthetic archived\n")
+
+            groups = discover("codex", root)
+
+            self.assertEqual(
+                sorted(path for group in groups for path in group.files),
+                [
+                    "archived_sessions/old/rollout-old.jsonl",
+                    "sessions/project/rollout-compressed.jsonl.zst",
+                    "sessions/project/rollout-plain.jsonl",
+                ],
+            )
 
     def test_diagnostic_scope_warning_has_no_fake_root_entry(self):
         with tempfile.TemporaryDirectory() as temp:

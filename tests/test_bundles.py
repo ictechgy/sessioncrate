@@ -93,6 +93,37 @@ class BundleTests(unittest.TestCase):
             original.unlink()
         return replacement
 
+    def _append_decoded_tar_bytes(
+        self, manifest: dict[str, object], extra: bytes
+    ) -> dict[str, object]:
+        blob = self.vault / str(manifest["blob"])
+        with gzip.open(blob, "rb") as compressed:
+            decoded = compressed.read()
+        encoded = io.BytesIO()
+        with gzip.GzipFile(fileobj=encoded, mode="wb", mtime=0) as compressed:
+            compressed.write(decoded + extra)
+        blob_bytes = encoded.getvalue()
+        blob_sha = hashlib.sha256(blob_bytes).hexdigest()
+        (self.vault / "bundles/blobs" / f"{blob_sha}.tar.gz").write_bytes(blob_bytes)
+        changed = dict(manifest)
+        changed["blob"] = f"bundles/blobs/{blob_sha}.tar.gz"
+        changed["blob_sha256"] = blob_sha
+        changed["compressed_bytes"] = len(blob_bytes)
+        return self._replace_manifest(changed)
+
+    def test_grouped_codex_scan_and_archive_reject_before_discovery(self) -> None:
+        bundles.sources.discover.reset_mock()
+
+        with self.assertRaisesRegex(VaultError, "storage backend"):
+            bundles.scan("codex", self.source, older_than_days=1)
+        with self.assertRaisesRegex(VaultError, "storage backend"):
+            bundles.archive(
+                "codex", self.source, self.vault, older_than_days=1, execute=True
+            )
+
+        bundles.sources.discover.assert_not_called()
+        self.assertFalse(self.vault.exists())
+
     def test_claude_companions_roundtrip_and_search(self) -> None:
         files = {
             "projects/demo/session-a.jsonl": (
@@ -1300,6 +1331,73 @@ class BundleTests(unittest.TestCase):
         self.assertEqual(len(result["matches"]), 1)
         self.assertEqual(result["skipped_records"], 1)
 
+    def test_decoded_tar_limit_rejects_excess_after_end_in_every_read_path(self) -> None:
+        relative = "export/bounded.txt"
+        self._group(
+            "agy",
+            "bounded",
+            {relative: b"needle\n"},
+            formats={relative: "text"},
+            source_mode="export",
+        )
+        manifest = bundles.archive(
+            "agy", self.source, self.vault, older_than_days=1, execute=True
+        )["archived"][0]
+        changed = self._append_decoded_tar_bytes(manifest, b"\0" * (2 * 1024 * 1024))
+
+        verified = bundles.verify(self.vault, str(changed["archive_id"]))
+        self.assertFalse(verified["ok"])
+        self.assertIn("decoded tar exceeds", verified["error"])
+        with self.assertRaisesRegex(VaultError, "decoded tar exceeds"):
+            bundles.search(self.vault, "needle", tool="agy")
+        with self.assertRaisesRegex(VaultError, "decoded tar exceeds"):
+            bundles.show(self.vault, str(changed["archive_id"]))
+        destination = self.root / "bounded-restore"
+        with self.assertRaisesRegex(VaultError, "decoded tar exceeds"):
+            bundles.restore(
+                self.vault, str(changed["archive_id"]), destination, execute=True
+            )
+        self.assertFalse(destination.exists())
+
+    def test_decoded_tar_reader_probes_only_one_byte_past_limit(self) -> None:
+        decoded = io.BytesIO(b"x" * 1024)
+        reader = bundles._BoundedReader(decoded, 10)
+
+        with self.assertRaisesRegex(VaultError, "decoded tar exceeds"):
+            reader.read(1024)
+
+        self.assertEqual(decoded.tell(), 11)
+
+    def test_long_unicode_pax_path_roundtrips_with_decoded_tar_limit(self) -> None:
+        component = ("긴경로" * 20) + ".txt"
+        relative = f"export/{component}"
+        payload = "PAX 유니코드 검색\n".encode()
+        self._group(
+            "agy",
+            "unicode-pax",
+            {relative: payload},
+            formats={relative: "text"},
+            source_mode="export",
+        )
+        manifest = bundles.archive(
+            "agy", self.source, self.vault, older_than_days=1, execute=True
+        )["archived"][0]
+
+        self.assertTrue(bundles.verify(self.vault, manifest["archive_id"])["ok"])
+        self.assertEqual(
+            bundles.search(self.vault, "유니코드", tool="agy")["matches"][0][
+                "member_path"
+            ],
+            relative,
+        )
+        destination = self.root / "unicode-pax-restore"
+        result = bundles.restore(
+            self.vault, manifest["archive_id"], destination, execute=True
+        )
+        self.assertEqual(result["destination_root"], str(destination))
+        self.assertEqual(result["file_count"], 1)
+        self.assertEqual((destination / relative).read_bytes(), payload)
+
     def test_search_unicode_casefold_snippet_keeps_the_match(self) -> None:
         relative = "export/unicode.txt"
         payload = (("ß" * 100) + "TARGET suffix\n").encode("utf-8")
@@ -1527,6 +1625,101 @@ class BundleTests(unittest.TestCase):
 
         self.assertFalse((destination / "projects/demo/session-s.jsonl").exists())
         self.assertFalse((destination / "projects/demo/session-s").exists())
+
+    def test_restore_failure_removes_all_created_destination_ancestors(self) -> None:
+        relative = "export/ancestor.txt"
+        self._group(
+            "agy",
+            "ancestor-cleanup",
+            {relative: b"payload\n"},
+            formats={relative: "text"},
+            source_mode="export",
+        )
+        manifest = bundles.archive(
+            "agy", self.source, self.vault, older_than_days=1, execute=True
+        )["archived"][0]
+        anchor = self.root / "existing-anchor"
+        anchor.mkdir()
+        destination = anchor / "created-parent" / "created-root"
+
+        with mock.patch.object(
+            bundles, "_copy_verified_stage", side_effect=OSError("synthetic ENOSPC")
+        ):
+            with self.assertRaisesRegex(OSError, "synthetic ENOSPC"):
+                bundles.restore(
+                    self.vault, manifest["archive_id"], destination, execute=True
+                )
+
+        self.assertTrue(anchor.is_dir())
+        self.assertFalse((anchor / "created-parent").exists())
+
+    def test_restore_failure_preserves_raced_foreign_root_and_cleans_owned_children(self) -> None:
+        relative = "export/raced-root.txt"
+        self._group(
+            "agy",
+            "raced-root",
+            {relative: b"payload\n"},
+            formats={relative: "text"},
+            source_mode="export",
+        )
+        manifest = bundles.archive(
+            "agy", self.source, self.vault, older_than_days=1, execute=True
+        )["archived"][0]
+        anchor = self.root / "race-anchor"
+        anchor.mkdir()
+        destination = anchor / "foreign-root"
+        sentinel = destination / "sentinel.txt"
+        foreign_mtime = time.time_ns() - 9 * 86_400 * 1_000_000_000
+        real_mkdir = bundles.os.mkdir
+        injected = False
+
+        def race_root(
+            path: Path | str, mode: int = 0o777, *args: object, **kwargs: object
+        ) -> None:
+            nonlocal injected
+            target = Path(path)
+            if target == destination and not injected:
+                real_mkdir(path, 0o711, *args, **kwargs)
+                sentinel.write_bytes(b"foreign\n")
+                os.utime(destination, ns=(foreign_mtime, foreign_mtime))
+                injected = True
+            real_mkdir(path, mode, *args, **kwargs)
+
+        with mock.patch.object(bundles.os, "mkdir", side_effect=race_root), mock.patch.object(
+            bundles, "_copy_verified_stage", side_effect=OSError("synthetic ENOSPC")
+        ):
+            with self.assertRaisesRegex(OSError, "synthetic ENOSPC"):
+                bundles.restore(
+                    self.vault, manifest["archive_id"], destination, execute=True
+                )
+
+        restored_stat = destination.stat()
+        self.assertTrue(injected)
+        self.assertEqual(stat.S_IMODE(restored_stat.st_mode), 0o711)
+        self.assertEqual(sentinel.read_bytes(), b"foreign\n")
+        self.assertFalse((destination / "export").exists())
+
+    def test_restore_preview_reports_destination_and_file_count(self) -> None:
+        relative = "export/preview-fields.txt"
+        self._group(
+            "agy",
+            "preview-fields",
+            {relative: b"payload\n"},
+            formats={relative: "text"},
+            source_mode="export",
+        )
+        manifest = bundles.archive(
+            "agy", self.source, self.vault, older_than_days=1, execute=True
+        )["archived"][0]
+        destination = self.root / "preview-fields-destination"
+
+        result = bundles.restore(
+            self.vault, manifest["archive_id"], destination, execute=False
+        )
+
+        self.assertEqual(result["destination_root"], str(destination))
+        self.assertEqual(result["file_count"], 1)
+        self.assertFalse(destination.exists())
 
     def test_restore_plaintext_stage_is_destination_adjacent_not_in_vault(self) -> None:
         relative = "export/near-destination.txt"

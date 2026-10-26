@@ -46,6 +46,8 @@ sessioncrate stats --json
 sessioncrate stats --tool claude --json  # only Claude archives and their retained originals
 ```
 
+Human output is summary-oriented: `scan`, `archive`, and `prune` previews state that no session files changed, each operation detail list is capped at 20 rows, and restore previews show the destination and file count. Use `--json` when a script needs the complete result; existing JSON fields remain available, and bundle restore results additionally expose `destination_root` and `file_count`. `list`, `search`, and `show` keep their command-specific `--limit` controls.
+
 Keeping the originals adds archive storage; space is reclaimed only after verified originals are removed. `stats` counts the archives, metadata, and retained originals, and reports unfinished temporary files that are still inside the vault. Those temporary files are incomplete artifacts, not validated archives; source quarantines and destination-adjacent restore stages outside the vault are deliberately not included. Preview cleanup, then opt in explicitly:
 
 ```sh
@@ -129,7 +131,9 @@ A unique archive-ID prefix is accepted. SHA-256 and compressed/member integrity 
 
 `list` reports valid entries alongside manifest errors, and `verify` aggregates failures. If one archive namespace cannot be searched, `search` returns healthy namespaces' matches with `partial: true` and `errors`; human output also identifies the failed namespace. When `list` has errors, its valid rows include full archive IDs so an intact entry can still be selected. An unrelated damaged manifest does not block full-ID recovery of an intact archive. A damaged matching prefix requires the full intact ID. `--tool codex` can avoid an unrelated bundle namespace, but a bundle tool filter still encounters malformed manifests in the shared bundle namespace, and no tool filter can bypass an unreadable namespace. Integrity and operational errors, including partial searches, return exit code `2`.
 
-Grouped restore uses a private staging directory near the destination. A crash can leave a `.codex-vault-restore-stage-*` plaintext staging directory; source-side archive or prune failures can also retain a quarantine for recovery. These paths are outside the vault's stats accounting and there is no automatic crash scavenger or quarantine cleanup. Multiple session roots are not published as one filesystem transaction. Compression is not encryption.
+Grouped restore uses a private staging directory near the destination. A failed restore cleans up only files and directories created by that attempt after filesystem identity checks; pre-existing, shared, or raced destination directories are left alone. A crash can leave a `.codex-vault-restore-stage-*` plaintext staging directory; source-side archive or prune failures can also retain a quarantine for recovery. These paths are outside the vault's stats accounting and there is no automatic crash scavenger or quarantine cleanup. Multiple session roots are not published as one filesystem transaction. Compression is not encryption.
+
+Gzip and bundle tar decoding stop when the declared source or bundle size is exceeded. Bundle limits include the normal PAX metadata overhead emitted by SessionCrate. These bounds stop a mismatched archive from being decoded indefinitely; they are not a general disk quota and do not provide a universal zip-bomb guarantee.
 
 ## Codex skill and compatibility
 
@@ -156,6 +160,6 @@ bash Scripts/verify.sh
 python Scripts/roundtrip_check.py
 ```
 
-Tests use temporary synthetic records. Do not use personal histories, account configuration, or authentication material as fixtures or attach them to an issue. See [compatibility and evidence](docs/compatibility.md) for the supported-platform matrix and the boundary between byte-level recovery and native application behavior.
+Tests use temporary synthetic records. The installed-wheel smoke check also archives, searches, and restores synthetic Codex and explicit export records from an isolated virtual environment. Do not use personal histories, account configuration, or authentication material as fixtures or attach them to an issue. See [compatibility and evidence](docs/compatibility.md) for the supported-platform matrix and the boundary between byte-level recovery and native application behavior.
 
 MIT license.

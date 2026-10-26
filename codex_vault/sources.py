@@ -133,14 +133,17 @@ def valid_relative(tool: str, path: str, source_mode: str) -> bool:
         if any(part.startswith(".") for part in parts):
             return False
         return tool in _EXPORT_TOOLS and path.lower().endswith(_EXPORT_EXTENSIONS)
+    if tool == "codex":
+        # Keep this validator permissive for historical grouped bundle
+        # manifests. New legacy archives use the stricter discovery predicate
+        # below and are routed through storage directly.
+        return len(parts) >= 2 and parts[0] in {"sessions", "archived_sessions"}
     if tool == "claude":
         return len(parts) >= 3 and parts[0] == "projects"
     if tool == "grok":
         return len(parts) >= 4 and parts[0] == "sessions"
     if tool == "gemini":
         return len(parts) == 4 and parts[0] == "tmp" and parts[2] == "chats" and parts[3].startswith("session-")
-    if tool == "codex":
-        return len(parts) >= 2 and parts[0] in {"sessions", "archived_sessions"}
     return False
 
 
@@ -155,6 +158,15 @@ def _is_forbidden_name(name: str) -> bool:
         or lower.startswith("credentials.")
         or lower.endswith((".key", ".pem"))
     )
+
+
+def _valid_codex_discovery_path(path: str) -> bool:
+    """Apply the legacy rollout filename contract to new discovery only."""
+    try:
+        storage._valid_relative_path(path)
+    except VaultError:
+        return False
+    return valid_relative("codex", path, "native")
 
 
 def _known_native_roots() -> tuple[Path, ...]:
@@ -499,7 +511,7 @@ def _discover_codex(root: Path) -> list[SessionGroup]:
             continue
         files, notes = _walk(root, base)
         for path in files:
-            if path.endswith(".jsonl"):
+            if _valid_codex_discovery_path(path):
                 groups.append(_group("codex", root, Path(path).stem, [path], [path]))
         if notes:
             groups.append(_discovery_warning_group("codex", root, notes, scope=scope))

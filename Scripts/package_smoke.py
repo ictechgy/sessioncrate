@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Install a built wheel in an isolated venv and exercise the public CLI.
 
-This smoke check only creates synthetic Codex records in a temporary directory.
+This smoke check creates synthetic Codex records and explicit export files in a
+temporary directory, then exercises both archive paths through the installed CLI.
 It never reads a checkout's user data, credentials, configuration, or sessions.
 """
 
@@ -208,7 +209,15 @@ def main(argv: list[str] | None = None) -> int:
             _fail("isolated wheel installation failed", install)
 
         import_check = _run(
-            [str(venv_python), "-c", "import codex_vault; print(codex_vault.__file__)"],
+            [
+                str(venv_python),
+                "-c",
+                (
+                    "import codex_vault, codex_vault.bundles, codex_vault.search, "
+                    "codex_vault.sources, codex_vault.storage, codex_vault.zstd_io; "
+                    "print(codex_vault.__file__)"
+                ),
+            ],
             cwd=temp,
             env=environment,
         )
@@ -260,6 +269,62 @@ def main(argv: list[str] | None = None) -> int:
         if not restored.is_file() or restored.read_bytes() != raw:
             raise RuntimeError("synthetic restored bytes do not match source bytes")
 
+        export_source = temp / "explicit-export"
+        export_source.mkdir()
+        export_file = export_source / "chat.md"
+        export_raw = "# SessionCrate export smoke 한글 검색\n\nexport bytes\n".encode("utf-8")
+        export_file.write_bytes(export_raw)
+        os.utime(export_file, (old, old))
+        export_destination = temp / "restored-export"
+        export_common = [
+            "--source-root",
+            str(export_source),
+            "--tool",
+            "export",
+            "--vault",
+            str(vault),
+            "--json",
+        ]
+        export_archive = _json_command(
+            command,
+            [*export_common, "archive", "--execute"],
+            cwd=temp,
+            env=environment,
+        )
+        if export_archive.get("errors") or not export_archive.get("archived"):
+            raise RuntimeError("synthetic export archive did not create an archive")
+        export_listing = _json_command(command, [*export_common, "list"], cwd=temp, env=environment)
+        export_archives = [item for item in export_listing.get("archives", []) if item.get("tool") == "export"]
+        if len(export_archives) != 1:
+            raise RuntimeError(f"expected one synthetic export archive, got {len(export_archives)}")
+        export_archive_id = export_archives[0]["archive_id"]
+        export_search = _json_command(
+            command,
+            [*export_common, "search", "export bytes"],
+            cwd=temp,
+            env=environment,
+        )
+        if not export_search.get("matches"):
+            raise RuntimeError("synthetic export search found no match")
+        export_restore = _json_command(
+            command,
+            [
+                *export_common,
+                "restore",
+                export_archive_id,
+                "--destination-home",
+                str(export_destination),
+                "--execute",
+            ],
+            cwd=temp,
+            env=environment,
+        )
+        if export_restore.get("errors"):
+            raise RuntimeError(f"synthetic export restore failed: {export_restore['errors']}")
+        restored_export = export_destination / "chat.md"
+        if not restored_export.is_file() or restored_export.read_bytes() != export_raw:
+            raise RuntimeError("synthetic export restored bytes do not match source bytes")
+
         evidence = _wheel_evidence(wheel)
         if sdist is not None:
             evidence.update(_sdist_evidence(sdist))
@@ -268,6 +333,9 @@ def main(argv: list[str] | None = None) -> int:
             "archive_id_prefix": archive_id[:12],
             "search_matches": len(search["matches"]),
             "restore_bytes": len(raw),
+            "export_archive_id_prefix": export_archive_id[:12],
+            "export_search_matches": len(export_search["matches"]),
+            "export_restore_bytes": len(export_raw),
             "prune_preview": True,
         })
         print(json.dumps(evidence, ensure_ascii=False, sort_keys=True))

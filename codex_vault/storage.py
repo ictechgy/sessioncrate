@@ -106,7 +106,47 @@ def _check_path_components(path: Path) -> None:
             raise VaultError(f"symlink path component is not allowed: {current}")
 
 
-def _mkdir_private(path: Path, *, tighten_existing: bool = True) -> Path:
+def _tighten_directory(path: Path, expected_identity: tuple[int, int]) -> None:
+    """Set private permissions through an identity-checked directory handle."""
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise VaultError(f"cannot open archive directory safely: {path}: {exc}") from exc
+    try:
+        opened = os.fstat(fd)
+        current = _lstat(path)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or current is None
+            or stat.S_ISLNK(current.st_mode)
+            or not stat.S_ISDIR(current.st_mode)
+            or (int(opened.st_dev), int(opened.st_ino)) != expected_identity
+            or (int(current.st_dev), int(current.st_ino)) != expected_identity
+        ):
+            raise VaultError(f"archive directory changed while being opened: {path}")
+        os.fchmod(fd, _PRIVATE_DIR)
+        after = os.fstat(fd)
+        current = _lstat(path)
+        if (
+            (int(after.st_dev), int(after.st_ino)) != expected_identity
+            or current is None
+            or stat.S_ISLNK(current.st_mode)
+            or not stat.S_ISDIR(current.st_mode)
+            or (int(current.st_dev), int(current.st_ino)) != expected_identity
+        ):
+            raise VaultError(f"archive directory changed while being secured: {path}")
+    finally:
+        os.close(fd)
+
+
+def _mkdir_private(
+    path: Path,
+    *,
+    tighten_existing: bool = True,
+    created_paths: list[tuple[Path, tuple[int, int]]] | None = None,
+) -> Path:
     """Create a directory tree while checking each existing component."""
 
     path = _absolute(path)
@@ -118,20 +158,28 @@ def _mkdir_private(path: Path, *, tighten_existing: bool = True) -> Path:
         if current.parent == current:
             break
         current = current.parent
+    created: set[Path] = set()
     for item in reversed(missing):
+        made_item = False
         try:
             os.mkdir(item, _PRIVATE_DIR)
+            made_item = True
         except FileExistsError:
             pass
         st = _lstat(item)
         if st is None or stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
             raise VaultError(f"unsafe archive directory: {item}")
-        os.chmod(item, _PRIVATE_DIR)
+        if made_item:
+            identity = (int(st.st_dev), int(st.st_ino))
+            created.add(item)
+            if created_paths is not None:
+                created_paths.append((item, identity))
+            _tighten_directory(item, identity)
     st = _lstat(path)
     if st is None or stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
         raise VaultError(f"unsafe archive directory: {path}")
-    if tighten_existing or path in missing:
-        os.chmod(path, _PRIVATE_DIR)
+    if tighten_existing and path not in created:
+        _tighten_directory(path, (int(st.st_dev), int(st.st_ino)))
     return path
 
 
@@ -1022,11 +1070,16 @@ def _verify_gzip(
             stream_context = gzip.GzipFile(fileobj=fileobj, mode="rb")
         with stream_context as stream:
             while True:
-                chunk = stream.read(1024 * 1024)
+                read_size = min(1024 * 1024, expected_size - total + 1)
+                if read_size <= 0:
+                    raise VaultError(f"archive blob digest or size mismatch: {path}")
+                chunk = stream.read(read_size)
                 if not chunk:
                     break
-                digest.update(chunk)
                 total += len(chunk)
+                if total > expected_size:
+                    raise VaultError(f"archive blob digest or size mismatch: {path}")
+                digest.update(chunk)
     except (OSError, EOFError, gzip.BadGzipFile, zlib.error) as exc:
         raise VaultError(f"archive blob is corrupt or truncated: {path}: {exc}") from exc
     if total != expected_size or digest.hexdigest() != expected_sha:
@@ -1455,22 +1508,65 @@ def verify(vault_dir: Path, archive_id: str | None = None) -> dict[str, Any]:
     }
 
 
-def _destination_root(destination_home: Path, *, create: bool) -> Path:
+def _destination_root(
+    destination_home: Path,
+    *,
+    create: bool,
+    created_paths: list[tuple[Path, tuple[int, int]]] | None = None,
+) -> Path:
     path = _absolute(destination_home)
     if create:
-        return _mkdir_private(path, tighten_existing=False)
+        return _mkdir_private(
+            path,
+            tighten_existing=False,
+            created_paths=created_paths,
+        )
     return _require_directory(path, label="destination home")
 
 
-def _safe_destination_path(root: Path, relative_path: str, *, create_parents: bool) -> Path:
+def _safe_destination_path(
+    root: Path,
+    relative_path: str,
+    *,
+    create_parents: bool,
+    created_paths: list[tuple[Path, tuple[int, int]]] | None = None,
+) -> Path:
     relative = PurePosixPath(_valid_relative_path(relative_path))
     path = root.joinpath(*relative.parts)
     if create_parents:
-        _mkdir_private(path.parent, tighten_existing=False)
+        _mkdir_private(
+            path.parent,
+            tighten_existing=False,
+            created_paths=created_paths,
+        )
     else:
         _check_path_components(path.parent)
     _check_path_components(path)
     return path
+
+
+def _cleanup_created_directories(
+    created_paths: list[tuple[Path, tuple[int, int]]],
+) -> None:
+    """Remove empty directories still matching this operation's identities."""
+
+    for path, identity in sorted(
+        created_paths,
+        key=lambda item: len(item[0].parts),
+        reverse=True,
+    ):
+        current = _lstat(path)
+        if (
+            current is None
+            or stat.S_ISLNK(current.st_mode)
+            or not stat.S_ISDIR(current.st_mode)
+            or (int(current.st_dev), int(current.st_ino)) != identity
+        ):
+            continue
+        try:
+            os.rmdir(path)
+        except OSError:
+            pass
 
 
 def restore(
@@ -1490,51 +1586,71 @@ def restore(
         if not check["ok"]:
             raise VaultError(check["error"])
         requested_root = Path(destination_home) if destination_home is not None else Path(manifest["source_root"])
-        if execute:
-            root = _destination_root(requested_root, create=True)
-        else:
-            root = _absolute(requested_root)
-            if _lstat(root) is not None:
-                root = _destination_root(root, create=False)
-            else:
-                _check_path_components(root)
-        target = _safe_destination_path(root, manifest["relative_path"], create_parents=execute)
-        result: dict[str, Any] = {
-            "ok": True,
-            "execute": bool(execute),
-            "executed": bool(execute),
-            "archive_id": manifest["archive_id"],
-            "destination": str(target),
-            "restored": False,
-            "skipped": False,
-        }
-        existing = _lstat(target)
-        if existing is not None:
-            if stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode):
-                raise VaultError(f"destination is an unsafe non-regular file: {target}")
-            existing_sha, existing_size, _ = _hash_path(target)
-            if existing_size == manifest["raw_bytes"] and existing_sha == manifest["blob_sha256"]:
-                result["skipped"] = True
-                return result
-            raise VaultError(f"destination already contains different bytes: {target}")
-        if not execute:
-            return result
-        blob = _blob_path(vault, manifest)
-        temp_fd, temp_name = tempfile.mkstemp(prefix=".vault-restore-", dir=target.parent)
-        temp = Path(temp_name)
+        created_paths: list[tuple[Path, tuple[int, int]]] = []
+        temp_fd = -1
+        temp: Path | None = None
         try:
+            if execute:
+                root = _destination_root(
+                    requested_root,
+                    create=True,
+                    created_paths=created_paths,
+                )
+            else:
+                root = _absolute(requested_root)
+                if _lstat(root) is not None:
+                    root = _destination_root(root, create=False)
+                else:
+                    _check_path_components(root)
+            target = _safe_destination_path(
+                root,
+                manifest["relative_path"],
+                create_parents=execute,
+                created_paths=created_paths,
+            )
+            result: dict[str, Any] = {
+                "ok": True,
+                "execute": bool(execute),
+                "executed": bool(execute),
+                "archive_id": manifest["archive_id"],
+                "destination": str(target),
+                "restored": False,
+                "skipped": False,
+            }
+            existing = _lstat(target)
+            if existing is not None:
+                if stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode):
+                    raise VaultError(f"destination is an unsafe non-regular file: {target}")
+                existing_sha, existing_size, _ = _hash_path(target)
+                if existing_size == manifest["raw_bytes"] and existing_sha == manifest["blob_sha256"]:
+                    result["skipped"] = True
+                    return result
+                raise VaultError(f"destination already contains different bytes: {target}")
+            if not execute:
+                return result
+            blob = _blob_path(vault, manifest)
+            temp_fd, temp_name = tempfile.mkstemp(prefix=".vault-restore-", dir=target.parent)
+            temp = Path(temp_name)
             os.fchmod(temp_fd, _PRIVATE_FILE)
             digest = hashlib.sha256()
             total = 0
             try:
-                with os.fdopen(temp_fd, "wb") as output, gzip.open(blob, "rb") as source:
+                output_stream = os.fdopen(temp_fd, "wb")
+                temp_fd = -1
+                with output_stream as output, gzip.open(blob, "rb") as source:
                     while True:
-                        chunk = source.read(1024 * 1024)
+                        read_size = min(1024 * 1024, manifest["raw_bytes"] - total + 1)
+                        if read_size <= 0:
+                            raise VaultError("archive blob size mismatch during restore")
+                        chunk = source.read(read_size)
                         if not chunk:
                             break
+                        next_total = total + len(chunk)
+                        if next_total > manifest["raw_bytes"]:
+                            raise VaultError("archive blob size mismatch during restore")
                         output.write(chunk)
                         digest.update(chunk)
-                        total += len(chunk)
+                        total = next_total
                     output.flush()
                     os.fsync(output.fileno())
             except (OSError, EOFError, gzip.BadGzipFile, zlib.error) as exc:
@@ -1554,10 +1670,17 @@ def restore(
             result["restored"] = True
             return result
         except Exception:
+            if temp_fd >= 0:
+                try:
+                    os.close(temp_fd)
+                except OSError:
+                    pass
             try:
-                temp.unlink(missing_ok=True)
+                if temp is not None:
+                    temp.unlink(missing_ok=True)
             except OSError:
                 pass
+            _cleanup_created_directories(created_paths)
             raise
 
 

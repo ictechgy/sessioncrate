@@ -546,6 +546,69 @@ class _HashingReader:
         return self._track(self.stream.readline(size))
 
 
+class _BoundedReader:
+    """Limit bytes returned by a decoded stream before consumers allocate them."""
+
+    def __init__(self, stream: BinaryIO, limit: int) -> None:
+        self.stream = stream
+        self.limit = limit
+        self.total = 0
+
+    def read(self, size: int = -1) -> bytes:
+        remaining_with_probe = self.limit - self.total + 1
+        if remaining_with_probe <= 0:
+            raise VaultError("bundle decoded tar exceeds safe size")
+        request = remaining_with_probe if size < 0 else min(size, remaining_with_probe)
+        data = self.stream.read(request)
+        self.total += len(data)
+        if self.total > self.limit:
+            raise VaultError("bundle decoded tar exceeds safe size")
+        return data
+
+
+def _pax_record_size(key: str, value: str) -> int:
+    content_size = len(key.encode("utf-8")) + len(value.encode("utf-8")) + 3
+    record_size = content_size + 1
+    while True:
+        updated = content_size + len(str(record_size))
+        if updated == record_size:
+            return record_size
+        record_size = updated
+
+
+def _round_tar_block(size: int) -> int:
+    return ((size + tarfile.BLOCKSIZE - 1) // tarfile.BLOCKSIZE) * tarfile.BLOCKSIZE
+
+
+def _decoded_tar_limit(manifest: dict[str, Any]) -> int:
+    """Upper-bound tar bytes emitted by this module's PAX writer.
+
+    Every member has a normal header and a custom nanosecond PAX record.  A
+    PAX writer may also need path, size, and mtime records, so include all of
+    them even when a particular value fits the ustar header.  The final record
+    allowance covers the two zero blocks and tarfile's RECORDSIZE padding.
+    """
+
+    total = 0
+    for entry in manifest["files"]:
+        pax_size = sum(
+            _pax_record_size(key, value)
+            for key, value in (
+                (_PAX_MTIME_NS, str(entry["mtime_ns"])),
+                ("path", entry["path"]),
+                ("size", str(entry["size"])),
+                ("mtime", str(entry["mtime_ns"] // 1_000_000_000)),
+            )
+        )
+        total += tarfile.BLOCKSIZE
+        total += _round_tar_block(entry["size"])
+        total += tarfile.BLOCKSIZE + _round_tar_block(pax_size)
+    return (
+        (total + 2 * tarfile.BLOCKSIZE + tarfile.RECORDSIZE - 1)
+        // tarfile.RECORDSIZE
+    ) * tarfile.RECORDSIZE
+
+
 def _tar_info(path: str, st: os.stat_result) -> tarfile.TarInfo:
     info = tarfile.TarInfo(path)
     info.type = tarfile.REGTYPE
@@ -713,7 +776,8 @@ def _stream_verified_blob(
             fd = -1
             compressed_reader = _HashingReader(raw)
             with gzip.GzipFile(fileobj=compressed_reader, mode="rb") as gz:
-                with tarfile.open(fileobj=gz, mode="r|") as tar:
+                decoded_reader = _BoundedReader(gz, _decoded_tar_limit(manifest))
+                with tarfile.open(fileobj=decoded_reader, mode="r|") as tar:
                     for member in tar:
                         name = member.name
                         if name in seen or name not in expected or not member.isreg() or member.linkname:
@@ -778,7 +842,7 @@ def _stream_verified_blob(
                             staged[name] = output_path
                         raw_total += actual_size
                         seen.add(name)
-                while gz.read(1024 * 1024):
+                while decoded_reader.read(1024 * 1024):
                     pass
             while compressed_reader.read(1024 * 1024):
                 pass
@@ -855,6 +919,8 @@ def _publish_blob(bundle_root: Path, temp: Path, sha: str) -> Path:
 
 
 def _group_candidates(tool: str, source_root: Path, older_than_days: int) -> list[dict[str, Any]]:
+    if tool == "codex":
+        raise VaultError("Codex sessions must use the storage backend")
     if isinstance(older_than_days, bool) or not isinstance(older_than_days, int) or older_than_days < 0:
         raise VaultError("older_than_days must be a non-negative integer")
     root = storage._require_directory(source_root, label="bundle source root")
@@ -923,7 +989,12 @@ def archive(
     remove_originals: bool = False,
 ) -> dict[str, Any]:
     candidates = _group_candidates(tool, source_root, older_than_days)
-    result: dict[str, Any] = {"execute": bool(execute), "executed": bool(execute), "candidates": [{key: value for key, value in item.items() if key != "_group"} for item in candidates], "archived": [], "removed": [], "skipped": [], "errors": [], "removed_source_bytes": 0}
+    result: dict[str, Any] = {"execute": bool(execute), "executed": bool(execute),
+                              "tool": tool, "source_root": str(_absolute(source_root)),
+                              "vault_dir": str(_absolute(vault_dir)),
+                              "remove_originals_requested": bool(remove_originals),
+                              "candidates": [{key: value for key, value in item.items() if key != "_group"} for item in candidates],
+                              "archived": [], "removed": [], "skipped": [], "errors": [], "removed_source_bytes": 0}
     if not execute:
         return result
     selected = [item for item in candidates if item["eligible"]]
@@ -1160,22 +1231,18 @@ def _restore_native_preflight(
     return equal
 
 
-def _mkdir_restore_directory(path: Path, mode: int) -> bool:
-    existing = _lstat(path)
-    if existing is not None:
-        if stat.S_ISLNK(existing.st_mode) or not stat.S_ISDIR(existing.st_mode):
-            raise VaultError(f"destination directory is unsafe: {path}")
-        return False
-    parent = path.parent
-    _mkdir_restore_directory(parent, _PRIVATE_DIR)
-    try:
-        os.mkdir(path, mode & 0o1777)
-        return True
-    except FileExistsError:
-        existing = _lstat(path)
-        if existing is None or stat.S_ISLNK(existing.st_mode) or not stat.S_ISDIR(existing.st_mode):
-            raise VaultError(f"destination directory is unsafe: {path}")
-        return False
+def _mkdir_restore_directory(
+    path: Path,
+    mode: int,
+    created_paths: list[tuple[Path, tuple[int, int]]] | None = None,
+) -> bool:
+    del mode  # Restore directories remain private until all files are published.
+    ownership = created_paths if created_paths is not None else []
+    start = len(ownership)
+    storage._mkdir_private(
+        path, tighten_existing=False, created_paths=ownership
+    )
+    return any(created == path for created, _identity in ownership[start:])
 
 
 def _cleanup_restore_stage(stage: Path, manifest: dict[str, Any]) -> None:
@@ -1246,22 +1313,27 @@ def _copy_verified_stage(staged: Path, output_fd: int, entry: dict[str, Any]) ->
 def _cleanup_restore_outputs(
     published_files: list[tuple[Path, tuple[int, int, int, int, int, int]]],
     created_directories: list[dict[str, Any]],
+    created_paths: list[tuple[Path, tuple[int, int]]] | None = None,
 ) -> None:
-    owned_directories: list[dict[str, Any]] = []
-    for directory in sorted(
-        created_directories,
-        key=lambda item: len(PurePosixPath(item["relative_path"]).parts),
-    ):
-        target = directory["target"]
+    candidates = (
+        created_paths
+        if created_paths is not None
+        else [
+            (directory["target"], directory["identity"])
+            for directory in created_directories
+        ]
+    )
+    owned_directories: list[tuple[Path, tuple[int, int]]] = []
+    for target, identity in sorted(candidates, key=lambda item: len(item[0].parts)):
         try:
-            fd = _open_restore_directory(target, directory["identity"])
+            fd = _open_restore_directory(target, identity)
             try:
                 os.fchmod(fd, _PRIVATE_DIR)
             finally:
                 os.close(fd)
         except (VaultError, OSError):
             continue
-        owned_directories.append(directory)
+        owned_directories.append((target, identity))
     for target, identity in reversed(published_files):
         current = _lstat(target)
         if current is not None and stat.S_ISREG(current.st_mode) and not stat.S_ISLNK(current.st_mode) and _identity_stat(current) == identity:
@@ -1269,10 +1341,11 @@ def _cleanup_restore_outputs(
                 os.unlink(target)
             except OSError:
                 pass
-    for directory in sorted(owned_directories, key=lambda item: len(PurePosixPath(item["relative_path"]).parts), reverse=True):
-        target = directory["target"]
+    for target, identity in sorted(
+        owned_directories, key=lambda item: len(item[0].parts), reverse=True
+    ):
         current = _lstat(target)
-        if current is None or stat.S_ISLNK(current.st_mode) or not stat.S_ISDIR(current.st_mode) or (current.st_dev, current.st_ino) != directory["identity"]:
+        if current is None or stat.S_ISLNK(current.st_mode) or not stat.S_ISDIR(current.st_mode) or (current.st_dev, current.st_ino) != identity:
             continue
         try:
             os.rmdir(target)
@@ -1318,7 +1391,16 @@ def restore(vault_dir: Path, archive_id: str, destination_home: Path | None = No
         root = _destination_root(Path(destination_home) if destination_home is not None else Path(manifest["source_root"]), False)
         trusted_files = _RestoreIdentityCache()
         equal = _restore_preflight(root, manifest, trusted_files)
-        result = {"ok": True, "execute": bool(execute), "executed": bool(execute), "archive_id": manifest["archive_id"], "restored": [], "skipped": list(equal)}
+        result = {
+            "ok": True,
+            "execute": bool(execute),
+            "executed": bool(execute),
+            "archive_id": manifest["archive_id"],
+            "destination_root": str(root),
+            "file_count": len(manifest["files"]),
+            "restored": [],
+            "skipped": list(equal),
+        }
         if not execute:
             check = _verify_blob(bundle_root, manifest)
             if not check["ok"]:
@@ -1327,22 +1409,38 @@ def restore(vault_dir: Path, archive_id: str, destination_home: Path | None = No
         stage, staged = _stage_restore_bundle(bundle_root, manifest, root)
         published_files: list[tuple[Path, tuple[int, int, int, int, int, int]]] = []
         created_directories: list[dict[str, Any]] = []
+        created_paths: list[tuple[Path, tuple[int, int]]] = []
         try:
             # Extraction can take time. Re-run the complete destination
             # preflight before creating anything so a tool that resumed in
             # the meantime cannot be overlaid with a native session.
             equal = _restore_preflight(root, manifest, trusted_files)
             result["skipped"] = list(equal)
-            storage._mkdir_private(root, tighten_existing=False)
+            storage._mkdir_private(
+                root, tighten_existing=False, created_paths=created_paths
+            )
             observed_unowned_directory = False
             for directory in sorted(manifest["directories"], key=lambda item: len(PurePosixPath(item["path"]).parts)):
                 target_directory = root.joinpath(*PurePosixPath(directory["path"]).parts)
-                created = _mkdir_restore_directory(target_directory, _PRIVATE_DIR)
+                created = _mkdir_restore_directory(
+                    target_directory, _PRIVATE_DIR, created_paths
+                )
                 if created:
+                    created_identity = next(
+                        identity
+                        for created_path, identity in reversed(created_paths)
+                        if created_path == target_directory
+                    )
                     created_stat = _lstat(target_directory)
-                    if created_stat is None or not stat.S_ISDIR(created_stat.st_mode) or stat.S_ISLNK(created_stat.st_mode):
+                    if (
+                        created_stat is None
+                        or not stat.S_ISDIR(created_stat.st_mode)
+                        or stat.S_ISLNK(created_stat.st_mode)
+                        or (created_stat.st_dev, created_stat.st_ino)
+                        != created_identity
+                    ):
                         raise VaultError(f"restored directory is unsafe: {directory['path']}")
-                    created_directories.append({"target": target_directory, "relative_path": directory["path"], "mode": directory["mode"], "mtime_ns": directory["mtime_ns"], "identity": (created_stat.st_dev, created_stat.st_ino)})
+                    created_directories.append({"target": target_directory, "relative_path": directory["path"], "mode": directory["mode"], "mtime_ns": directory["mtime_ns"], "identity": created_identity})
                 else:
                     observed_unowned_directory = True
             if observed_unowned_directory:
@@ -1352,7 +1450,11 @@ def restore(vault_dir: Path, archive_id: str, destination_home: Path | None = No
                 if entry["path"] in equal:
                     continue
                 target = root.joinpath(*PurePosixPath(entry["path"]).parts)
-                storage._mkdir_private(target.parent, tighten_existing=False)
+                storage._mkdir_private(
+                    target.parent,
+                    tighten_existing=False,
+                    created_paths=created_paths,
+                )
                 fd, name = tempfile.mkstemp(prefix=".bundle-restore-", dir=target.parent)
                 temp = Path(name)
                 try:
@@ -1381,7 +1483,9 @@ def restore(vault_dir: Path, archive_id: str, destination_home: Path | None = No
             for directory in sorted(created_directories, key=lambda item: len(PurePosixPath(item["relative_path"]).parts), reverse=True):
                 _apply_restore_directory_metadata(directory)
         except Exception:
-            _cleanup_restore_outputs(published_files, created_directories)
+            _cleanup_restore_outputs(
+                published_files, created_directories, created_paths
+            )
             raise
         finally:
             _cleanup_restore_stage(stage, manifest)
@@ -1938,8 +2042,8 @@ def prune(vault_dir: Path, archive_id: str | None = None, execute: bool = False,
         return result
 
 
-def _snippet(text: str, query: str, limit: int = 240) -> str:
-    span = _casefold_span(text, query)
+def _snippet(text: str, query: str, limit: int = 240, *, folded_query: str | None = None) -> str:
+    span = _casefold_span(text, query, folded_query=folded_query)
     if span is None:
         return text[:limit]
     start = max(0, span[0] - limit // 3)
@@ -1951,6 +2055,7 @@ def search(vault_dir: Path, query: str, limit: int = 20, project: str | None = N
         raise VaultError("query must not be blank")
     if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
         raise VaultError("limit must be greater than zero")
+    folded_query = query.casefold()
     vault = storage._safe_vault(vault_dir, create=False)
     if vault is None:
         return {"query": query, "matches": [], "scanned_archives": 0, "truncated": False, "skipped_records": 0}
@@ -1978,11 +2083,11 @@ def search(vault_dir: Path, query: str, limit: int = 20, project: str | None = N
                     archive_skipped += 1
                     return
                 text = str(record.get("text", ""))
-                if query.casefold() not in text.casefold():
+                if folded_query not in text.casefold():
                     return
                 total_matches += 1
                 if len(matches) + len(archive_matches) < limit:
-                    archive_matches.append({"archive_id": manifest["archive_id"], "tool": manifest["tool"], "session_id": manifest["session_id"], "cwd": manifest["cwd"], "member_path": entry["path"], "line": record.get("line"), "kind": record.get("kind", "text"), "snippet": _snippet(text, query)})
+                    archive_matches.append({"archive_id": manifest["archive_id"], "tool": manifest["tool"], "session_id": manifest["session_id"], "cwd": manifest["cwd"], "member_path": entry["path"], "line": record.get("line"), "kind": record.get("kind", "text"), "snippet": _snippet(text, query, folded_query=folded_query)})
 
             blob = bundle_root.parent / manifest["blob"]
             _stream_verified_blob(blob, manifest, record_callback=collect)
@@ -1994,6 +2099,7 @@ def search(vault_dir: Path, query: str, limit: int = 20, project: str | None = N
 def show(vault_dir: Path, archive_id: str, limit: int = 100, query: str | None = None) -> dict[str, Any]:
     if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
         raise VaultError("limit must be greater than zero")
+    folded_query = query.casefold() if query is not None else None
     vault = storage._safe_vault(vault_dir, create=False)
     if vault is None:
         raise VaultError("vault does not exist")
@@ -2011,7 +2117,7 @@ def show(vault_dir: Path, archive_id: str, limit: int = 100, query: str | None =
             if record.get("skipped"):
                 skipped += 1
                 return
-            if query and query.casefold() not in str(record.get("text", "")).casefold():
+            if folded_query is not None and folded_query not in str(record.get("text", "")).casefold():
                 return
             matching_records += 1
             if len(records) < limit:

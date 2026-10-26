@@ -6,6 +6,8 @@ from pathlib import Path
 import re
 import sys
 
+from .presentation import _clean, _print_human, _size
+
 
 def _options(parser, *, subcommand=False):
     fallback = argparse.SUPPRESS if subcommand else None
@@ -79,84 +81,6 @@ def parser(program_name=None):
                                      help='Restore below a separate source directory, instead of the original location')
     commands['restore'].add_argument('--execute', action='store_true', help='Write restored files; otherwise preview only')
     return root
-
-
-def _clean(value):
-    text = str(value)
-    text = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', text)
-    return ''.join(ch if ch.isprintable() or ch == '\n' else ' ' for ch in text)
-
-
-def _size(value):
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return _clean(value)
-    value = float(value)
-    for unit in ('B', 'KiB', 'MiB', 'GiB', 'TiB'):
-        if abs(value) < 1024 or unit == 'TiB':
-            return f'{value:,.1f} {unit}'
-        value /= 1024
-
-
-def _print_human(result):
-    if 'tools' in result:
-        for tool in result['tools']:
-            print(f"{tool['id']:10}  {_clean(tool['label'])}  [{tool['mode']}]")
-            print(f"  {_clean(tool.get('default_root') or '--source-root REQUIRED')}")
-            print(f"  {_clean(tool.get('caveat', ''))}")
-        return
-    if 'matches' in result:
-        for hit in result['matches']:
-            print(f"[{_clean(hit.get('tool', 'codex'))}] {hit['archive_id'][:12]}  {_clean(hit.get('cwd', ''))}  line {hit['line']}  {_clean(hit['kind'])}")
-            source = hit.get('member_path') or hit.get('relative_path')
-            if source:
-                print(f"  source: {_clean(source)}")
-            print(f"  {_clean(hit['snippet'])}")
-        print(f"{len(result['matches'])} match(es), {result.get('scanned_archives', 0)} archive(s) scanned")
-        if result.get('truncated'):
-            print('Result limit reached; narrow the query or increase --limit.')
-        if result.get('skipped_records'):
-            print(f"Skipped {result['skipped_records']} oversized or unsupported record(s).")
-        if result.get('errors'):
-            print('Partial results: some archive namespaces could not be searched.')
-            for error in result['errors']:
-                print(f"  {_clean(error['namespace'])}: {_clean(error['error'])}")
-        return
-    if 'archives' in result and isinstance(result['archives'], list):
-        rows = result['archives']
-        for item in rows:
-            if isinstance(item, dict):
-                archive_id = str(item.get('archive_id', ''))
-                # Prefix resolution cannot prove uniqueness across an unreadable
-                # namespace. Keep intact archives addressable from this output.
-                display_id = archive_id if result.get('errors') else archive_id[:12]
-                print(f"[{_clean(item.get('tool', 'codex'))}] {display_id}  {_size(item.get('raw_bytes', 0))} -> "
-                      f"{_size(item.get('compressed_bytes', 0))}  {_clean(item.get('cwd', ''))}")
-        if not rows:
-            print('No archives. Run archive --execute to create one.')
-    if 'records' in result:
-        for record in result['records']:
-            print(f"[{record.get('line', '?')}] {_clean(record.get('kind', ''))}")
-            if record.get('member_path'):
-                print(f"  source: {_clean(record['member_path'])}")
-            print(_clean(record.get('text', '')))
-    for key, value in result.items():
-        if key in ('archives', 'matches', 'records'):
-            continue
-        label = key.replace('_', ' ')
-        if key == 'candidates' and isinstance(value, list):
-            for item in value:
-                if isinstance(item, dict):
-                    paths = item.get('relative_path') or ', '.join(item.get('root_entries', []))
-                    print(f"{_clean(paths)}  "
-                          f"{_size(item.get('size', item.get('source_bytes', item.get('bytes', 0))))}  "
-                          f"{_clean(item.get('reason', ''))}")
-            print(f'{len(value)} candidate(s)')
-        elif isinstance(value, (list, dict)):
-            print(f'{label}: {_clean(json.dumps(value, ensure_ascii=False))}')
-        elif 'bytes' in key and isinstance(value, (int, float)):
-            print(f'{label}: {_size(value)}')
-        else:
-            print(f'{label}: {_clean(value)}')
 
 
 def _archive_catalog(vault, selected_tool=None, *, prefix=''):
@@ -382,16 +306,20 @@ def main(argv=None, *, program_name=None):
             raise storage.VaultError('--older-than must be nonnegative')
         if hasattr(args, 'limit') and not 1 <= args.limit <= 1000:
             raise storage.VaultError('--limit must be between 1 and 1000')
-        data_home = Path(os.environ.get('XDG_DATA_HOME', str(Path.home() / '.local/share')))
         try:
-            vault = (args.vault or data_home / 'codex-vault').expanduser()
+            if args.vault is not None:
+                vault = args.vault.expanduser()
+            else:
+                configured_data_home = os.environ.get('XDG_DATA_HOME')
+                data_home = Path(configured_data_home) if configured_data_home else Path.home() / '.local/share'
+                vault = (data_home / 'codex-vault').expanduser()
         except RuntimeError as error:
             raise storage.VaultError('vault home could not be expanded') from error
         result = _run(args, vault)
         if args.json:
             print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         else:
-            _print_human(result)
+            _print_human(result, command=args.command)
         if result.get('ok') is False or result.get('errors') or result.get('failed'):
             return 2
         return 0

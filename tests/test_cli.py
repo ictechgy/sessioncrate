@@ -361,6 +361,147 @@ class CLITests(unittest.TestCase):
         self.assertIn(self.source.relative_to(self.home).as_posix(), result.stdout)
         self.assertIn('line 2', result.stdout)
 
+    def test_human_preview_is_bounded_and_explains_eligibility(self):
+        from codex_vault.cli import _print_human
+        candidates = [{'relative_path': f'sessions/rollout-{index}.jsonl',
+                       'size': 1024, 'eligible': True, 'reason': 'eligible'} for index in range(1000)]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            _print_human({'executed': False, 'candidates': candidates, 'archived': [],
+                          'removed': [], 'skipped': [], 'errors': []}, command='archive')
+        text = output.getvalue()
+        self.assertIn('Preview', text)
+        self.assertIn('1000 eligible', text)
+        self.assertIn('980 more', text)
+        self.assertIn('--json', text)
+        self.assertLess(len(text.splitlines()), 40)
+
+    def test_human_archive_reports_outcome_without_dumping_manifests(self):
+        from codex_vault import cli
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            status = cli.main(['--vault', str(self.vault), '--source-root', str(self.home),
+                               'archive', '--execute'])
+        self.assertEqual(status, 0)
+        text = output.getvalue()
+        self.assertIn('Archived 1', text)
+        self.assertIn('0 original(s) removed', text)
+        self.assertNotIn('blob_sha256', text)
+        self.assertNotIn('source_mtime_ns', text)
+        self.assertEqual(self.source.read_bytes(), self.raw)
+
+    def test_human_bundle_restore_preview_shows_destination_and_file_count(self):
+        from codex_vault import bundles, cli
+        source = self.base / 'export'
+        source.mkdir()
+        (source / 'record.txt').write_text('synthetic session')
+        item = bundles.archive('export', source, self.vault, older_than_days=0, execute=True)['archived'][0]
+        destination = self.base / 'preview destination'
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            status = cli.main(['--vault', str(self.vault), 'restore', item['archive_id'],
+                               '--destination-home', str(destination)])
+        self.assertEqual(status, 0)
+        self.assertIn('Preview', output.getvalue())
+        self.assertIn('1 file(s)', output.getvalue())
+        self.assertIn(str(destination), output.getvalue())
+        self.assertFalse(destination.exists())
+
+    def test_human_archive_preview_identifies_source_and_requested_removal(self):
+        from codex_vault import cli
+        source = self.base / 'explicit exports'
+        source.mkdir()
+        original = source / 'chat.txt'
+        original.write_text('synthetic transcript')
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            status = cli.main(['--vault', str(self.vault), '--source-root', str(source),
+                               '--tool', 'export', 'archive', '--older-than', '0', '--remove-originals'])
+        self.assertEqual(status, 0)
+        self.assertIn(str(source), output.getvalue())
+        self.assertIn('Original removal requested', output.getvalue())
+        self.assertEqual(original.read_text(), 'synthetic transcript')
+        self.assertFalse(self.vault.exists())
+
+    def test_human_stats_separates_storage_costs_and_partial_errors(self):
+        from codex_vault.cli import _print_human
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            _print_human({'archive_count': 1, 'vault_bytes': 2048, 'source_bytes_retained': 4096,
+                          'temporary_files': 2, 'temporary_bytes': 1024, 'allocated_bytes': 8192,
+                          'net_storage_bytes': 6144, 'partial': True,
+                          'codex': {'archives': 1}, 'bundles': {},
+                          'errors': [{'namespace': 'bundles', 'error': 'synthetic unreadable namespace'}]},
+                         command='stats')
+        text = output.getvalue()
+        for marker in ('Vault storage', 'Retained originals', 'Temporary files', 'Partial results',
+                       'synthetic unreadable namespace'):
+            self.assertIn(marker, text)
+        self.assertNotIn('{', text)
+
+    def test_human_metadata_cannot_inject_status_lines(self):
+        from codex_vault.cli import _print_human
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            _print_human({'archives': [{'archive_id': 'a' * 64,
+                                       'cwd': '/project\nFAKE SUCCESS\rhidden\tfield'}],
+                          'total': 1, 'errors': []}, command='list')
+        text = output.getvalue()
+        self.assertNotIn('\nFAKE SUCCESS', text)
+        self.assertNotIn('\r', text)
+        self.assertIn(r'/project\nFAKE SUCCESS', text)
+
+    def test_explicit_vault_does_not_require_resolvable_user_home(self):
+        from codex_vault import cli
+        output = io.StringIO()
+        with mock.patch.object(Path, 'home', side_effect=RuntimeError('synthetic unknown home')), \
+             contextlib.redirect_stdout(output):
+            status = cli.main(['--vault', str(self.vault), '--json', 'list'])
+        self.assertEqual(status, 0)
+        self.assertEqual(json.loads(output.getvalue())['archives'], [])
+
+    def test_human_partial_archive_keeps_failure_and_preservation_reasons_visible(self):
+        from codex_vault.cli import _print_human
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            _print_human({'executed': True, 'archived': [], 'removed': [], 'candidates': [],
+                          'errors': [{'session_id': 'failed-session', 'reason': 'synthetic disk full'}],
+                          'skipped': [{'relative_path': 'sessions/rollout-busy.jsonl', 'reason': 'session file is open'}]},
+                         command='archive')
+        text = output.getvalue()
+        self.assertIn('Errors: 1', text)
+        self.assertIn('failed-session: synthetic disk full', text)
+        self.assertIn('Originals preserved: 1', text)
+        self.assertIn('session file is open', text)
+
+    def test_direct_human_renderer_preserves_execution_state_and_backend_shapes(self):
+        from codex_vault.cli import _print_human
+        examples = [
+            ({'executed': True, 'candidates': [], 'archived': [], 'removed': []}, 'Archived 0'),
+            ({'executed': True, 'candidates': [], 'removed': []}, 'Removed 0'),
+            ({'executed': True, 'restored': True, 'skipped': False, 'destination': '/synthetic'}, '1 restored'),
+            ({'executed': True, 'restored': ['one'], 'skipped': ['two']}, '1 restored, 1 unchanged'),
+            ({'archives': 0, 'archive_count': 0}, 'Vault storage'),
+            ({'ok': True, 'archive_id': 'a' * 64}, 'Verified:'),
+        ]
+        for result, marker in examples:
+            with self.subTest(marker=marker):
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    _print_human(result)
+                self.assertIn(marker, output.getvalue())
+                self.assertNotIn('Preview', output.getvalue())
+
+    def test_missing_default_home_returns_safe_error(self):
+        from codex_vault import cli
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, {'XDG_DATA_HOME': ''}), \
+             mock.patch.object(Path, 'home', side_effect=RuntimeError('synthetic unknown home')), \
+             contextlib.redirect_stdout(output):
+            status = cli.main(['--json', 'list'])
+        self.assertEqual(status, 2)
+        self.assertIn('vault home', json.loads(output.getvalue())['error'])
+
     def test_human_search_and_show_identify_bundle_members(self):
         from codex_vault import bundles
         home = self.base / 'grok fixture'

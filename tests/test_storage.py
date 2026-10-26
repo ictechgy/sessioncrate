@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import errno
 import gzip
+import hashlib
 import io
 import json
 import os
+import random
 import shutil
 import stat
 import tempfile
@@ -101,6 +103,88 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(vault.stat().st_mode), 0o750)
         self.assertEqual(stat.S_IMODE((vault / "blobs").stat().st_mode), 0o700)
         self.assertEqual(stat.S_IMODE((vault / "manifests").stat().st_mode), 0o700)
+
+    def test_mkdir_private_does_not_chmod_root_created_by_a_racer(self) -> None:
+        target = self.tmp_path / "raced root"
+        real_mkdir = storage.os.mkdir
+        raced = False
+        created_paths: list[tuple[Path, tuple[int, int]]] = []
+
+        def concurrent_create(path, mode=0o777, *args, **kwargs):
+            nonlocal raced
+            if Path(path) == target and not raced:
+                raced = True
+                real_mkdir(path, 0o750, *args, **kwargs)
+                os.chmod(path, 0o750)
+                raise FileExistsError(errno.EEXIST, "concurrent directory creation", path)
+            return real_mkdir(path, mode, *args, **kwargs)
+
+        with mock.patch.object(storage.os, "mkdir", side_effect=concurrent_create):
+            result = storage._mkdir_private(
+                target,
+                tighten_existing=False,
+                created_paths=created_paths,
+            )
+
+        self.assertTrue(raced)
+        self.assertEqual(result, target)
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o750)
+        self.assertEqual(created_paths, [])
+
+    def test_mkdir_private_tracks_only_owned_intermediate_directories(self) -> None:
+        top = self.tmp_path / "created top"
+        raced_parent = top / "raced parent"
+        target = raced_parent / "created leaf"
+        real_mkdir = storage.os.mkdir
+        raced = False
+        created_paths: list[tuple[Path, tuple[int, int]]] = []
+
+        def concurrent_create(path, mode=0o777, *args, **kwargs):
+            nonlocal raced
+            if Path(path) == raced_parent and not raced:
+                raced = True
+                real_mkdir(path, 0o750, *args, **kwargs)
+                os.chmod(path, 0o750)
+                raise FileExistsError(errno.EEXIST, "concurrent directory creation", path)
+            return real_mkdir(path, mode, *args, **kwargs)
+
+        with mock.patch.object(storage.os, "mkdir", side_effect=concurrent_create):
+            storage._mkdir_private(
+                target,
+                tighten_existing=False,
+                created_paths=created_paths,
+            )
+
+        self.assertTrue(raced)
+        self.assertEqual(stat.S_IMODE(raced_parent.stat().st_mode), 0o750)
+        self.assertEqual([path for path, _identity in created_paths], [top, target])
+        for path, identity in created_paths:
+            current = path.stat()
+            self.assertEqual(identity, (current.st_dev, current.st_ino))
+            self.assertEqual(stat.S_IMODE(current.st_mode), 0o700)
+
+    def test_mkdir_private_reports_owned_path_when_tightening_fails(self) -> None:
+        target = self.tmp_path / "created before tighten failure"
+        created_paths: list[tuple[Path, tuple[int, int]]] = []
+
+        with mock.patch.object(
+            storage,
+            "_tighten_directory",
+            side_effect=storage.VaultError("synthetic tightening failure"),
+        ):
+            with self.assertRaisesRegex(storage.VaultError, "synthetic tightening failure"):
+                storage._mkdir_private(
+                    target,
+                    tighten_existing=False,
+                    created_paths=created_paths,
+                )
+
+        self.assertEqual(len(created_paths), 1)
+        self.assertEqual(created_paths[0][0], target)
+        target_stat = target.stat()
+        self.assertEqual(created_paths[0][1], (target_stat.st_dev, target_stat.st_ino))
+        storage._cleanup_created_directories(created_paths)
+        self.assertFalse(target.exists())
 
     def test_rearchive_preserves_existing_manifest_and_blob_permissions(self) -> None:
         home = make_codex_home(self.tmp_path)
@@ -314,6 +398,121 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(len(opened), 1)
         with self.assertRaises(OSError):
             os.fstat(opened[0])
+
+    def test_verify_gzip_stops_reading_after_decoded_size_overrun(self) -> None:
+        payload = random.Random(0).randbytes(3 * 1024 * 1024)
+        encoded = _gzip_bytes(payload)
+
+        class CountingReader(io.BytesIO):
+            def __init__(self, value: bytes):
+                super().__init__(value)
+                self.bytes_read = 0
+
+            def read(self, size: int = -1) -> bytes:
+                value = super().read(size)
+                self.bytes_read += len(value)
+                return value
+
+        source = CountingReader(encoded)
+        with self.assertRaisesRegex(storage.VaultError, "size mismatch"):
+            storage._verify_gzip(
+                self.tmp_path / "synthetic archive.gz",
+                hashlib.sha256(payload).hexdigest(),
+                1024,
+                fileobj=source,
+            )
+
+        self.assertLess(source.bytes_read, len(encoded) // 2)
+
+    def test_restore_rejects_decoded_overrun_before_writing_that_chunk(self) -> None:
+        home = make_codex_home(self.tmp_path)
+        source = make_session(home)
+        original = source.read_bytes()
+        vault = self.tmp_path / "vault"
+        storage.archive(home, vault, older_than_days=1, execute=True)
+        manifest = self._manifest(vault)
+        blob = vault / manifest["blob"]
+        blob.write_bytes(_gzip_bytes(original + random.Random(1).randbytes(2 * 1024 * 1024)))
+        source.unlink()
+        destination = self.tmp_path / "restore destination"
+        retained_temp = self.tmp_path / "retained restore temp"
+        temp_fd = os.open(retained_temp, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        real_unlink = Path.unlink
+
+        def retain_temp(path: Path, *args, **kwargs):
+            if path == retained_temp:
+                return None
+            return real_unlink(path, *args, **kwargs)
+
+        with mock.patch.object(storage, "_verify_one", return_value={"ok": True}), mock.patch.object(
+            storage.tempfile,
+            "mkstemp",
+            return_value=(temp_fd, str(retained_temp)),
+        ), mock.patch.object(Path, "unlink", autospec=True, side_effect=retain_temp):
+            with self.assertRaisesRegex(storage.VaultError, "size|digest"):
+                storage.restore(vault, manifest["archive_id"], destination, execute=True)
+
+        self.assertEqual(retained_temp.read_bytes(), b"")
+        self.assertFalse((destination / manifest["relative_path"]).exists())
+
+    def test_restore_read_failure_removes_all_owned_destination_directories(self) -> None:
+        home = make_codex_home(self.tmp_path)
+        source = make_session(home)
+        vault = self.tmp_path / "vault"
+        storage.archive(home, vault, older_than_days=1, execute=True)
+        manifest = self._manifest(vault)
+        source.unlink()
+        destination = self.tmp_path / "new restore root" / "nested root"
+
+        class FailingReader:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self, size=-1):
+                raise OSError("synthetic restore read failure")
+
+        with mock.patch.object(storage, "_verify_one", return_value={"ok": True}), mock.patch.object(
+            storage.gzip,
+            "open",
+            return_value=FailingReader(),
+        ):
+            with self.assertRaisesRegex(storage.VaultError, "corrupt during restore"):
+                storage.restore(vault, manifest["archive_id"], destination, execute=True)
+
+        self.assertFalse(destination.exists())
+        self.assertFalse(destination.parent.exists())
+
+    def test_restore_failure_preserves_raced_foreign_destination_directory(self) -> None:
+        home = make_codex_home(self.tmp_path)
+        source = make_session(home)
+        vault = self.tmp_path / "vault"
+        storage.archive(home, vault, older_than_days=1, execute=True)
+        manifest = self._manifest(vault)
+        source.unlink()
+        destination = self.tmp_path / "raced restore root"
+        target_parent = destination / Path(manifest["relative_path"]).parent
+        sentinel = target_parent / "foreign.txt"
+        foreign_mtime = time.time_ns() - 5_000_000_000
+
+        def replace_owned_directory(*args, **kwargs):
+            target_parent.rmdir()
+            target_parent.mkdir(mode=0o711)
+            os.chmod(target_parent, 0o711)
+            sentinel.write_bytes(b"foreign bytes")
+            os.utime(target_parent, ns=(foreign_mtime, foreign_mtime))
+            raise OSError("synthetic tempfile failure")
+
+        with mock.patch.object(storage.tempfile, "mkstemp", side_effect=replace_owned_directory):
+            with self.assertRaisesRegex(OSError, "synthetic tempfile failure"):
+                storage.restore(vault, manifest["archive_id"], destination, execute=True)
+
+        self.assertEqual(sentinel.read_bytes(), b"foreign bytes")
+        raced_stat = target_parent.stat()
+        self.assertEqual(stat.S_IMODE(raced_stat.st_mode), 0o711)
+        self.assertEqual(raced_stat.st_mtime_ns, foreign_mtime)
 
     def test_restore_normalizes_invalid_deflate_without_publishing_destination(self) -> None:
         home = make_codex_home(self.tmp_path)

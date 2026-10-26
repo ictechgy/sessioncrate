@@ -8,6 +8,10 @@ Original reclamation is explicit and checks the archived bytes, current source, 
 
 Do not remove a retained quarantine just to make a retry succeed. Preserve it and the archive, then reproduce the failure with synthetic data. Crashes can leave a private destination-adjacent plaintext restore stage, and interrupted archive work can leave incomplete `.vault-blob-*`, `.vault-tmp-*`, `.bundle-*`, or `.bundle-manifest-*` files inside the vault. Top-level `stats` sums the in-vault temporary files across namespaces; nested `codex` and `bundles` results retain their namespace-specific fields. These files and their logical and allocated bytes are not validated archives. Source quarantines and restore stages outside the vault are not counted. Preserve all of these artifacts for recovery; automatic scavenging and crash cleanup are not provided.
 
+Failed bundle restore cleanup removes only files and directories created by that restore after their filesystem identities are checked. Pre-existing, shared, or raced destination directories are left alone. Gzip and bundle tar decoding stop when the declared source or bundle size is exceeded; the bundle bound includes normal PAX metadata overhead. These checks are early-abort integrity bounds, not a general disk quota or a universal zip-bomb defense.
+
+Treat externally supplied vaults as untrusted input. A forged manifest can claim a large source size, and the standard-library tar reader can allocate extended-header metadata within that declared allowance before member validation. SessionCrate does not impose an independent process-memory quota for that case.
+
 Batch pruning fails closed when a recognized manifest is malformed. Archive work that fails before manifest publication is reported as an error and returns CLI status `2`; an original that is preserved after a published archive is reported as a skip. Use a full intact archive ID for recovery. `--tool codex` can avoid the bundle namespace, but a bundle tool filter still inspects the shared bundle manifest namespace; no tool filter can isolate an unreadable namespace.
 
 ## Report a vulnerability privately

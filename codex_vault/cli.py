@@ -1,5 +1,6 @@
 """Command line interface for private, recoverable Codex transcript archives."""
 import argparse
+from itertools import zip_longest
 import json
 import os
 from pathlib import Path
@@ -289,7 +290,10 @@ def _run(args, vault):
             if name == 'codex':
                 result['matches'] = [{**item, 'tool': 'codex'} for item in result['matches']]
             results.append(result)
-        matches = [item for result in results for item in result['matches']]
+        # Keep one busy backend from hiding every result from the other one.
+        # Each backend retains its own ordering and integrity checks.
+        matches = [hit for row in zip_longest(*(result['matches'] for result in results))
+                   for hit in row if hit is not None]
         return {'query': args.query, 'matches': matches[:args.limit],
                 'scanned_archives': sum(result.get('scanned_archives', 0) for result in results),
                 'skipped_records': sum(result.get('skipped_records', 0) for result in results),
@@ -324,6 +328,15 @@ def main(argv=None, *, program_name=None):
             return 2
         return 0
     except storage.VaultError as error:
+        if isinstance(error, storage.BatchOperationError):
+            partial = {**error.partial_result, 'ok': False, 'partial': True, 'error': str(error)}
+            if args.json:
+                print(json.dumps(partial, ensure_ascii=False, sort_keys=True))
+            else:
+                print('Operation stopped; completed work and recovery details follow:')
+                _print_human(partial, command=args.command)
+                print(f'Error: {_clean(error)}', file=sys.stderr)
+            return 2
         if args.json:
             print(json.dumps({'error': str(error)}, ensure_ascii=False))
         else:

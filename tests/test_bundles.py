@@ -4,6 +4,7 @@ import hashlib
 import gzip
 import io
 import json
+import multiprocessing
 import os
 import stat
 import tarfile
@@ -16,7 +17,13 @@ from types import SimpleNamespace
 from unittest import mock
 
 from codex_vault import bundles
-from codex_vault.storage import VaultError
+from codex_vault.storage import BatchOperationError, VaultError
+
+
+def _hold_shared_vault_lock(vault: str, ready: object, release: object) -> None:
+    with bundles.storage._vault_lock(Path(vault), exclusive=False, create=False):
+        ready.set()
+        release.wait(10)
 
 
 class BundleTests(unittest.TestCase):
@@ -215,6 +222,31 @@ class BundleTests(unittest.TestCase):
         self.assertEqual(len(result["errors"]), 1)
         self.assertEqual(result["errors"][0]["session_id"], "snapshot-fails")
         self.assertIn("snapshot failure", result["errors"][0]["reason"])
+
+    def test_group_candidate_capture_failure_keeps_common_summary_fields(self) -> None:
+        relative = "export/unreadable-candidate.txt"
+        group = self._group(
+            "agy",
+            "unreadable-candidate",
+            {relative: b"payload\n"},
+            formats={relative: "text"},
+            source_mode="export",
+        )
+        outside = self.root / "candidate-outside.txt"
+        outside.write_bytes(b"outside\n")
+        target = self.source / relative
+        target.unlink()
+        target.symlink_to(outside)
+
+        rows = bundles._group_candidates("agy", self.source, older_than_days=1)
+
+        row = next(item for item in rows if item["session_id"] == group.session_id)
+        self.assertEqual(row["cwd"], group.cwd)
+        self.assertEqual(row["source_mode"], "export")
+        self.assertEqual(row["mtime_ns"], 0)
+        self.assertEqual(row["files"], [])
+        self.assertEqual(row["root_entries"], [])
+        self.assertFalse(row["eligible"])
 
     def test_glm_and_agy_exports_are_explicit_and_tagged(self) -> None:
         glm = self._group(
@@ -443,6 +475,85 @@ class BundleTests(unittest.TestCase):
         self.assertEqual(result["skipped"], [relative])
         self.assertEqual(hashed.call_count, 1)
 
+    def test_restore_equal_destination_verifies_without_extracting_stage(self) -> None:
+        relative = "export/fast-path.txt"
+        payload = b"already restored\n"
+        self._group(
+            "agy",
+            "fast-path",
+            {relative: payload},
+            formats={relative: "text"},
+            source_mode="export",
+        )
+        bundles.archive("agy", self.source, self.vault, older_than_days=1, execute=True)
+        manifest = bundles.list_archives(self.vault)[0]
+        destination = self.root / "restore-fast-path"
+        target = destination / relative
+        target.parent.mkdir(parents=True)
+        target.write_bytes(payload)
+
+        with mock.patch.object(
+            bundles, "_stage_restore_bundle", side_effect=AssertionError("stage not expected")
+        ):
+            result = bundles.restore(self.vault, manifest["archive_id"], destination, execute=True)
+
+        self.assertEqual(result["restored"], [])
+        self.assertEqual(result["skipped"], [relative])
+
+    def test_restore_equal_destination_still_rejects_corrupt_blob(self) -> None:
+        relative = "export/fast-path-corrupt.txt"
+        payload = b"must verify archive\n"
+        self._group(
+            "agy",
+            "fast-path-corrupt",
+            {relative: payload},
+            formats={relative: "text"},
+            source_mode="export",
+        )
+        bundles.archive("agy", self.source, self.vault, older_than_days=1, execute=True)
+        manifest = bundles.list_archives(self.vault)[0]
+        destination = self.root / "restore-fast-path-corrupt"
+        target = destination / relative
+        target.parent.mkdir(parents=True)
+        target.write_bytes(payload)
+        (self.vault / manifest["blob"]).write_bytes(b"corrupt blob")
+
+        with self.assertRaises(VaultError):
+            bundles.restore(self.vault, manifest["archive_id"], destination, execute=True)
+
+    def test_restore_equal_destination_does_not_hide_identity_change_during_verify(self) -> None:
+        relative = "export/fast-path-race.txt"
+        payload = b"same bytes after replacement\n"
+        self._group(
+            "agy",
+            "fast-path-race",
+            {relative: payload},
+            formats={relative: "text"},
+            source_mode="export",
+        )
+        bundles.archive("agy", self.source, self.vault, older_than_days=1, execute=True)
+        manifest = bundles.list_archives(self.vault)[0]
+        destination = self.root / "restore-fast-path-race"
+        target = destination / relative
+        target.parent.mkdir(parents=True)
+        target.write_bytes(payload)
+        real_verify = bundles._verify_blob
+
+        def replace_after_verify(bundle_root: Path, checked_manifest: dict[str, object]) -> dict[str, object]:
+            result = real_verify(bundle_root, checked_manifest)
+            target.unlink()
+            target.write_bytes(payload)
+            return result
+
+        with mock.patch.object(bundles, "_verify_blob", side_effect=replace_after_verify), mock.patch.object(
+            bundles, "_stage_restore_bundle", wraps=bundles._stage_restore_bundle
+        ) as staged:
+            result = bundles.restore(self.vault, manifest["archive_id"], destination, execute=True)
+
+        self.assertEqual(result["restored"], [])
+        self.assertEqual(result["skipped"], [relative])
+        staged.assert_called_once()
+
     def test_restore_reuses_verified_identity_for_equal_native_files(self) -> None:
         files = {
             "projects/demo/session-reuse.jsonl": b"a\n",
@@ -499,7 +610,7 @@ class BundleTests(unittest.TestCase):
         with mock.patch.object(bundles, "_restore_preflight", side_effect=mutate_after_second_preflight):
             with self.assertRaises(VaultError):
                 bundles.restore(self.vault, manifest["archive_id"], destination, execute=True)
-        self.assertEqual(calls, 2)
+        self.assertGreaterEqual(calls, 2)
         self.assertEqual(target.read_bytes(), b"changed\n")
 
     def test_restore_reads_tar_once_for_multiple_members(self) -> None:
@@ -843,6 +954,80 @@ class BundleTests(unittest.TestCase):
         self.assertEqual(result["errors"][0]["session_id"], "broken")
         self.assertIn("synthetic changed group", result["errors"][0]["reason"])
 
+    def test_archive_publication_failure_preserves_completed_batch_result(self) -> None:
+        paths = {
+            "first": "export/first-publication.txt",
+            "second": "export/second-publication.txt",
+        }
+        for session_id, relative in paths.items():
+            self._group(
+                "agy",
+                session_id,
+                {relative: f"{session_id}\n".encode()},
+                formats={relative: "text"},
+                source_mode="export",
+            )
+        real_write = bundles._write_manifest_atomic
+
+        def fail_second_manifest(path: Path, manifest: dict[str, object]) -> dict[str, object]:
+            if manifest["session_id"] == "second":
+                raise VaultError("synthetic publication failure")
+            return real_write(path, manifest)
+
+        with mock.patch.object(
+            bundles, "_write_manifest_atomic", side_effect=fail_second_manifest
+        ), self.assertRaises(BatchOperationError) as raised:
+            bundles.archive(
+                "agy",
+                self.source,
+                self.vault,
+                older_than_days=1,
+                execute=True,
+                remove_originals=True,
+            )
+
+        partial = raised.exception.partial_result
+        self.assertEqual(
+            [item["session_id"] for item in partial["archived"]], ["first"]
+        )
+        self.assertEqual(partial["removed"], [])
+        self.assertEqual(partial["removed_source_bytes"], 0)
+        self.assertEqual(partial["errors"][-1]["session_id"], "second")
+        self.assertIn("publication failure", partial["errors"][-1]["reason"])
+        for relative in paths.values():
+            self.assertTrue((self.source / relative).exists())
+
+    def test_archive_temp_cleanup_failure_preserves_accumulated_errors(self) -> None:
+        relative = "export/temp-cleanup.txt"
+        self._group(
+            "agy",
+            "temp-cleanup",
+            {relative: b"payload\n"},
+            formats={relative: "text"},
+            source_mode="export",
+        )
+        real_unlink = Path.unlink
+
+        def fail_bundle_temp_unlink(path: Path, *args: object, **kwargs: object) -> None:
+            if path.name.startswith(".bundle-"):
+                raise OSError("synthetic temporary cleanup failure")
+            real_unlink(path, *args, **kwargs)
+
+        with mock.patch.object(
+            bundles.sources,
+            "metadata_from_bytes",
+            side_effect=VaultError("synthetic metadata failure"),
+        ), mock.patch.object(
+            Path, "unlink", fail_bundle_temp_unlink
+        ), self.assertRaises(BatchOperationError) as raised:
+            bundles.archive(
+                "agy", self.source, self.vault, older_than_days=1, execute=True
+            )
+
+        reasons = [item["reason"] for item in raised.exception.partial_result["errors"]]
+        self.assertTrue(any("metadata failure" in reason for reason in reasons))
+        self.assertTrue(any("temporary cleanup failure" in reason for reason in reasons))
+
     def test_native_restore_rechecks_for_new_descendants_after_staging(self) -> None:
         files = {
             "projects/demo/session-m.jsonl": b"main\n",
@@ -907,6 +1092,53 @@ class BundleTests(unittest.TestCase):
             self.assertEqual((self.source / relative).read_bytes(), payload)
         self.assertFalse(list(self.source.glob("projects/demo/.codex-vault-pending-bundle-*")))
 
+    def test_missing_staged_root_during_activity_probe_stops_batch(self) -> None:
+        paths: dict[str, str] = {}
+        for name in ("a", "b", "c"):
+            relative = f"projects/demo/disappears-{name}.jsonl"
+            paths[f"disappears-{name}"] = relative
+            self._group(
+                "claude",
+                f"disappears-{name}",
+                {relative: f"payload-{name}\n".encode()},
+                formats={relative: "text"},
+            )
+        manifests = bundles.archive(
+            "claude", self.source, self.vault, older_than_days=1, execute=True
+        )["archived"]
+        ordered = sorted(manifests, key=lambda item: item["archive_id"])
+        quarantine_probes = 0
+
+        def remove_second_staged_root(path: Path) -> dict[str, str]:
+            nonlocal quarantine_probes
+            if path.name.startswith(".codex-vault-pending-bundle-"):
+                quarantine_probes += 1
+                if quarantine_probes == 2:
+                    for child in path.iterdir():
+                        child.unlink()
+                    return {"state": "active", "reason": "synthetic concurrent removal"}
+            return {"state": "inactive", "reason": "synthetic inactive"}
+
+        with mock.patch.object(
+            bundles.activity, "probe_session_file", side_effect=remove_second_staged_root
+        ), mock.patch.object(
+            bundles.activity, "probe_session_tree", side_effect=remove_second_staged_root
+        ), self.assertRaises(BatchOperationError) as raised:
+            bundles.prune(self.vault, execute=True, tool="claude")
+
+        partial = raised.exception.partial_result
+        self.assertEqual(partial["removed"], [ordered[0]["archive_id"]])
+        self.assertEqual(partial["removed_source_bytes"], ordered[0]["raw_bytes"])
+        self.assertEqual(partial["errors"][-1]["archive_id"], ordered[1]["archive_id"])
+        self.assertTrue(partial["errors"][-1]["source_missing"])
+        first_path = paths[ordered[0]["session_id"]]
+        second_path = paths[ordered[1]["session_id"]]
+        third_path = paths[ordered[2]["session_id"]]
+        self.assertFalse((self.source / first_path).exists())
+        self.assertFalse((self.source / second_path).exists())
+        self.assertTrue((self.source / third_path).exists())
+        self.assertTrue(bundles.verify(self.vault)["ok"])
+
     def test_identical_archive_rerun_reuses_strict_published_manifest(self) -> None:
         relative = "export/idempotent.txt"
         self._group("agy", "idempotent", {relative: b"same\n"}, formats={relative: "text"}, source_mode="export")
@@ -956,6 +1188,125 @@ class BundleTests(unittest.TestCase):
             "preserve",
         )
         self.assertTrue(bundles.verify(self.vault, manifest["archive_id"])["ok"])
+
+    def test_prune_fatal_failure_preserves_earlier_removal_and_quarantine(self) -> None:
+        first_path = "projects/demo/batch-first.jsonl"
+        second_path = "projects/demo/batch-second.jsonl"
+        first_payload = b"removed before later failure\n"
+        second_payload = b"retained in quarantine\n"
+        self._group(
+            "claude", "batch-first", {first_path: first_payload}, formats={first_path: "text"}
+        )
+        self._group(
+            "claude", "batch-second", {second_path: second_payload}, formats={second_path: "text"}
+        )
+        manifests = bundles.archive(
+            "claude", self.source, self.vault, older_than_days=1, execute=True
+        )["archived"]
+        first_manifest, second_manifest = sorted(
+            manifests, key=lambda item: item["archive_id"]
+        )
+        first_id = first_manifest["archive_id"]
+        second_id = second_manifest["archive_id"]
+        path_by_session = {
+            "batch-first": first_path,
+            "batch-second": second_path,
+        }
+        payload_by_session = {
+            "batch-first": first_payload,
+            "batch-second": second_payload,
+        }
+        real_remove = bundles._remove_quarantine_exact
+
+        def fail_second_removal(quarantine: Path, manifest: dict[str, object]) -> None:
+            if manifest["archive_id"] == second_id:
+                raise bundles._QuarantineRemovalStarted(
+                    f"synthetic fatal removal; quarantine retained: {quarantine}"
+                )
+            real_remove(quarantine, manifest)
+
+        inactive = {"state": "inactive", "reason": "synthetic inactive"}
+        with mock.patch.object(
+            bundles.activity, "probe_session_file", return_value=inactive
+        ), mock.patch.object(
+            bundles.activity, "probe_session_tree", return_value=inactive
+        ), mock.patch.object(
+            bundles, "_remove_quarantine_exact", side_effect=fail_second_removal
+        ), self.assertRaises(BatchOperationError) as raised:
+            bundles.prune(self.vault, execute=True, tool="claude")
+
+        partial = raised.exception.partial_result
+        self.assertEqual(partial["removed"], [first_id])
+        self.assertEqual(
+            partial["removed_source_bytes"],
+            len(payload_by_session[first_manifest["session_id"]]),
+        )
+        self.assertEqual(partial["errors"][-1]["archive_id"], second_id)
+        self.assertFalse(
+            (self.source / path_by_session[first_manifest["session_id"]]).exists()
+        )
+        self.assertFalse(
+            (self.source / path_by_session[second_manifest["session_id"]]).exists()
+        )
+        skipped = [item for item in partial["skipped"] if item["archive_id"] == second_id]
+        self.assertEqual(len(skipped), 1)
+        quarantine = Path(skipped[0]["quarantine"])
+        failed_path = path_by_session[second_manifest["session_id"]]
+        self.assertEqual(
+            (quarantine / Path(failed_path).name).read_bytes(),
+            payload_by_session[second_manifest["session_id"]],
+        )
+
+    def test_archive_prune_failure_preserves_archive_and_removal_results(self) -> None:
+        first_path = "projects/demo/archive-prune-first.jsonl"
+        second_path = "projects/demo/archive-prune-second.jsonl"
+        first_payload = b"first archived and removed\n"
+        second_payload = b"second archived and retained\n"
+        self._group(
+            "claude", "archive-prune-first", {first_path: first_payload}, formats={first_path: "text"}
+        )
+        self._group(
+            "claude", "archive-prune-second", {second_path: second_payload}, formats={second_path: "text"}
+        )
+        real_prune = bundles._prune_one
+        calls = 0
+
+        def fail_after_first_prune(
+            vault: Path,
+            bundle_root: Path,
+            manifest: dict[str, object],
+            result: dict[str, object],
+        ) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise VaultError("synthetic second prune failure")
+            real_prune(vault, bundle_root, manifest, result)
+
+        inactive = {"state": "inactive", "reason": "synthetic inactive"}
+        with mock.patch.object(
+            bundles.activity, "probe_session_file", return_value=inactive
+        ), mock.patch.object(
+            bundles.activity, "probe_session_tree", return_value=inactive
+        ), mock.patch.object(
+            bundles, "_prune_one", side_effect=fail_after_first_prune
+        ), self.assertRaises(BatchOperationError) as raised:
+            bundles.archive(
+                "claude",
+                self.source,
+                self.vault,
+                older_than_days=1,
+                execute=True,
+                remove_originals=True,
+            )
+
+        partial = raised.exception.partial_result
+        self.assertEqual(len(partial["archived"]), 2)
+        self.assertEqual(len(partial["removed"]), 1)
+        self.assertEqual(partial["removed_source_bytes"], len(first_payload))
+        self.assertIn("second prune failure", partial["errors"][-1]["reason"])
+        self.assertFalse((self.source / first_path).exists())
+        self.assertEqual((self.source / second_path).read_bytes(), second_payload)
 
     def test_prune_setup_failure_skips_group_and_continues_batch(self) -> None:
         for session_id in ("setup-fails", "setup-healthy"):
@@ -1042,6 +1393,43 @@ class BundleTests(unittest.TestCase):
         self.assertFalse((self.source / relative).exists())
         self.assertFalse(list((self.source / "projects/demo").glob(".codex-vault-pending-bundle-*")))
 
+    def test_prune_post_deletion_failure_preserves_removed_partial_result(self) -> None:
+        relative = "projects/demo/session-sync-partial.jsonl"
+        payload = b"removed before reported durability failure\n"
+        self._group(
+            "claude", "session-sync-partial", {relative: payload}, formats={relative: "text"}
+        )
+        manifest = bundles.archive(
+            "claude", self.source, self.vault, older_than_days=1, execute=True
+        )["archived"][0]
+        real_fsync = bundles.storage._fsync_directory
+        sync_calls = 0
+
+        def fail_second_sync(path: Path) -> None:
+            nonlocal sync_calls
+            sync_calls += 1
+            if sync_calls == 2:
+                raise VaultError("synthetic post-deletion sync failure")
+            real_fsync(path)
+
+        inactive = {"state": "inactive", "reason": "synthetic inactive"}
+        with mock.patch.object(
+            bundles.activity, "probe_session_file", return_value=inactive
+        ), mock.patch.object(
+            bundles.activity, "probe_session_tree", return_value=inactive
+        ), mock.patch.object(
+            bundles.storage, "_fsync_directory", side_effect=fail_second_sync
+        ), self.assertRaises(BatchOperationError) as raised:
+            bundles.prune(self.vault, manifest["archive_id"], execute=True)
+
+        partial = raised.exception.partial_result
+        self.assertFalse(partial["ok"])
+        self.assertEqual(partial["removed"], [manifest["archive_id"]])
+        self.assertEqual(partial["removed_source_bytes"], len(payload))
+        self.assertEqual(partial["errors"][-1]["archive_id"], manifest["archive_id"])
+        self.assertIn("durability", partial["errors"][-1]["reason"])
+        self.assertFalse((self.source / relative).exists())
+
     def test_file_rollback_never_replaces_a_raced_original(self) -> None:
         parent = self.root / "rollback-file"
         quarantine = parent / ".pending"
@@ -1068,6 +1456,92 @@ class BundleTests(unittest.TestCase):
         self.assertEqual(original.read_bytes(), b"new live bytes\n")
         self.assertEqual(staged.read_bytes(), b"archived original\n")
         self.assertTrue(any(item.get("quarantine") == str(quarantine) for item in outcome["skipped"]))
+
+    def test_prune_rename_failures_restore_sources_without_false_quarantine_reason(self) -> None:
+        inactive = {"state": "inactive", "reason": "synthetic inactive"}
+        for failure_call in (1, 2):
+            with self.subTest(failure_call=failure_call):
+                session_id = f"rename-failure-{failure_call}"
+                main = f"projects/demo/{session_id}.jsonl"
+                files = {main: b"main\n"}
+                roots: tuple[str, ...] = (main,)
+                if failure_call == 2:
+                    companion = f"projects/demo/{session_id}"
+                    files[f"{companion}/worker.txt"] = b"worker\n"
+                    roots = (main, companion)
+                self._group(
+                    "claude",
+                    session_id,
+                    files,
+                    formats={path: "text" for path in files},
+                    root_entries=roots,
+                )
+                manifest = bundles.archive(
+                    "claude", self.source, self.vault, older_than_days=1, execute=True
+                )["archived"][-1]
+                real_rename = bundles.os.rename
+                calls = 0
+
+                def fail_selected_rename(source: Path | str, target: Path | str) -> None:
+                    nonlocal calls
+                    calls += 1
+                    if calls == failure_call:
+                        raise OSError("synthetic source rename failure")
+                    real_rename(source, target)
+
+                with mock.patch.object(
+                    bundles.activity,
+                    "probe_session_file",
+                    return_value=inactive,
+                ), mock.patch.object(
+                    bundles.activity,
+                    "probe_session_tree",
+                    return_value=inactive,
+                ), mock.patch.object(
+                    bundles.os,
+                    "rename",
+                    side_effect=fail_selected_rename,
+                ):
+                    result = bundles.prune(
+                        self.vault, manifest["archive_id"], execute=True
+                    )
+
+                for relative, payload in files.items():
+                    self.assertEqual((self.source / relative).read_bytes(), payload)
+                self.assertFalse(
+                    list((self.source / "projects/demo").glob(".codex-vault-pending-bundle-*"))
+                )
+                skipped = [
+                    item
+                    for item in result["skipped"]
+                    if item.get("archive_id") == manifest["archive_id"]
+                ]
+                self.assertEqual(len(skipped), 1)
+                self.assertNotIn("retained", skipped[0]["reason"])
+                self.assertNotIn("quarantine", skipped[0])
+
+    def test_unsupported_rollback_keeps_quarantine_and_bytes(self) -> None:
+        parent = self.root / "unsupported-rollback"
+        quarantine = parent / ".pending"
+        quarantine.mkdir(parents=True)
+        original = parent / "session.jsonl"
+        staged = quarantine / "session.jsonl"
+        payload = b"preserve for recovery\n"
+        staged.write_bytes(payload)
+        outcome = {"archive_id": "c" * 64, "skipped": []}
+
+        with mock.patch.object(bundles, "_move_no_replace", return_value=False):
+            restored = bundles._restore_quarantine(
+                [(original, staged)],
+                quarantine,
+                outcome,
+                "bundle prune failed during source transition",
+            )
+
+        self.assertFalse(restored)
+        self.assertFalse(original.exists())
+        self.assertEqual(staged.read_bytes(), payload)
+        self.assertEqual(outcome["skipped"][0]["quarantine"], str(quarantine))
 
     def test_directory_rollback_never_replaces_a_raced_original(self) -> None:
         parent = self.root / "rollback-directory"
@@ -1418,6 +1892,71 @@ class BundleTests(unittest.TestCase):
         self.assertEqual(len(result["records"]), 2)
         self.assertFalse(result["truncated"])
 
+    def test_show_query_validation_matches_search(self) -> None:
+        relative = "export/show-query.txt"
+        self._group(
+            "agy",
+            "show-query",
+            {relative: b"query value\n"},
+            formats={relative: "text"},
+            source_mode="export",
+        )
+        manifest = bundles.archive(
+            "agy", self.source, self.vault, older_than_days=1, execute=True
+        )["archived"][0]
+
+        self.assertEqual(
+            bundles.show(self.vault, manifest["archive_id"], query=None)["records"][0]["text"],
+            "query value",
+        )
+        for query in ("", " ", 123):
+            with self.subTest(query=query):
+                with self.assertRaisesRegex(VaultError, "query must not be blank"):
+                    bundles.show(self.vault, manifest["archive_id"], query=query)  # type: ignore[arg-type]
+
+    def test_restore_preview_shares_vault_lock_but_execute_requires_exclusive_lock(self) -> None:
+        relative = "export/shared-lock.txt"
+        self._group(
+            "agy",
+            "shared-lock",
+            {relative: b"shared lock payload\n"},
+            formats={relative: "text"},
+            source_mode="export",
+        )
+        manifest = bundles.archive(
+            "agy", self.source, self.vault, older_than_days=1, execute=True
+        )["archived"][0]
+        context = multiprocessing.get_context()
+        ready = context.Event()
+        release = context.Event()
+        holder = context.Process(
+            target=_hold_shared_vault_lock,
+            args=(str(self.vault), ready, release),
+        )
+        holder.start()
+        try:
+            self.assertTrue(ready.wait(5))
+            preview = bundles.restore(
+                self.vault,
+                manifest["archive_id"],
+                self.root / "shared-lock-preview",
+                execute=False,
+            )
+            self.assertEqual(preview["file_count"], 1)
+            with self.assertRaisesRegex(VaultError, "locked"):
+                bundles.restore(
+                    self.vault,
+                    manifest["archive_id"],
+                    self.root / "shared-lock-execute",
+                    execute=True,
+                )
+        finally:
+            release.set()
+            holder.join(5)
+            if holder.is_alive():
+                holder.terminate()
+                holder.join(5)
+
     def test_restore_readonly_directory_applies_mode_after_files(self) -> None:
         files = {
             "projects/demo/session-r.jsonl": b"main\n",
@@ -1741,6 +2280,31 @@ class BundleTests(unittest.TestCase):
         self.assertFalse(observed[0].exists())
         self.assertFalse(list((self.vault / "bundles").glob(".bundle-restore-stage-*")))
 
+    def test_restore_stage_uses_mkdtemp_private_mode_without_path_chmod(self) -> None:
+        relative = "export/private-stage.txt"
+        self._group(
+            "agy",
+            "private-stage",
+            {relative: b"payload\n"},
+            formats={relative: "text"},
+            source_mode="export",
+        )
+        bundles.archive("agy", self.source, self.vault, older_than_days=1, execute=True)
+        manifest = bundles.list_archives(self.vault)[0]
+        destination = self.root / "private-stage-destination"
+
+        with mock.patch.object(
+            bundles.os, "chmod", side_effect=AssertionError("stage path chmod is unnecessary")
+        ):
+            stage, staged = bundles._stage_restore_bundle(
+                self.vault / "bundles", manifest, destination
+            )
+        try:
+            self.assertEqual(stat.S_IMODE(stage.stat().st_mode), 0o700)
+            self.assertIn(relative, staged)
+        finally:
+            bundles._cleanup_restore_stage(stage, manifest)
+
     def test_restore_directory_metadata_race_never_touches_symlink_target(self) -> None:
         files = {
             "projects/demo/session-meta.jsonl": b"main\n",
@@ -1892,6 +2456,42 @@ class BundleTests(unittest.TestCase):
         self.assertEqual(filtered["bundle_temporary_allocated_bytes"], 0)
         self.assertEqual(filtered["bundle_vault_bytes"], result["bundle_vault_bytes"] - result["bundle_temporary_bytes"])
         self.assertTrue(outside.exists())
+
+    def test_stats_count_only_canonical_published_blob_names(self) -> None:
+        relative = "export/stats-name-filter.txt"
+        self._group(
+            "agy",
+            "stats-name-filter",
+            {relative: b"payload\n"},
+            formats={relative: "text"},
+            source_mode="export",
+        )
+        bundles.archive("agy", self.source, self.vault, older_than_days=1, execute=True)
+        blobs = self.vault / "bundles/blobs"
+        baseline = bundles.stats(self.vault)
+
+        valid_orphan = blobs / ("d" * 64 + ".tar.gz")
+        valid_orphan.write_bytes(b"valid orphan")
+        after_valid = bundles.stats(self.vault)
+        self.assertEqual(after_valid["bundle_blobs"], baseline["bundle_blobs"] + 1)
+        self.assertEqual(
+            after_valid["bundle_blob_bytes"],
+            baseline["bundle_blob_bytes"] + valid_orphan.stat().st_size,
+        )
+
+        outside = self.root / "stats-name-filter-outside"
+        outside.write_bytes(b"symlink target")
+        for name in (
+            "g" * 64 + ".tar.gz",
+            "d" * 63 + ".tar.gz",
+            "d" * 64 + ".tgz",
+            "d" * 64 + ".tar.gz.bak",
+        ):
+            (blobs / name).write_bytes(b"ignored")
+        (blobs / ("e" * 64 + ".tar.gz")).symlink_to(outside)
+
+        after_invalid = bundles.stats(self.vault)
+        self.assertEqual(after_invalid, after_valid)
 
     def test_diagnostic_manifest_cannot_expand_log_scope_or_use_generic_reader(self) -> None:
         relative = "model-io-sess-boundary.jsonl"

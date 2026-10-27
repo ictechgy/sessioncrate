@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import fcntl
 import gzip
 import hashlib
 import io
@@ -65,6 +66,21 @@ class StorageTests(unittest.TestCase):
         self.assertFalse(result["execute"])
         self.assertFalse(vault.exists())
         self.assertTrue(result["candidates"])
+
+    def test_archive_always_reports_remove_originals_request(self) -> None:
+        home = make_codex_home(self.tmp_path)
+        make_session(home)
+        vault = self.tmp_path / "vault"
+
+        preview = storage.archive(
+            home, vault, older_than_days=1, execute=False, remove_originals=True
+        )
+        executed = storage.archive(
+            home, vault, older_than_days=1, execute=True, remove_originals=False
+        )
+
+        self.assertTrue(preview["remove_originals_requested"])
+        self.assertFalse(executed["remove_originals_requested"])
 
     def test_archive_roundtrip_gzip_and_manifest(self) -> None:
         home = make_codex_home(self.tmp_path)
@@ -728,6 +744,25 @@ class StorageTests(unittest.TestCase):
         self.assertFalse(preview["skipped"])
         self.assertFalse(absent_root.exists())
 
+    def test_restore_preview_shares_read_lock_while_execute_requires_exclusive(self) -> None:
+        home = make_codex_home(self.tmp_path)
+        make_session(home)
+        vault = self.tmp_path / "vault"
+        storage.archive(home, vault, older_than_days=1, execute=True)
+        manifest = self._manifest(vault)
+        lock_fd = os.open(vault / ".lock", os.O_RDWR)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            preview = storage.restore(
+                vault, manifest["archive_id"], execute=False
+            )
+            self.assertTrue(preview["skipped"])
+            with self.assertRaisesRegex(storage.VaultError, "vault is locked"):
+                storage.restore(vault, manifest["archive_id"], execute=True)
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+
     def test_restore_preview_rejects_unsafe_destination_without_following_it(self) -> None:
         home = make_codex_home(self.tmp_path)
         make_session(home)
@@ -1077,6 +1112,47 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(len(result['removed']), 1)
         self.assertEqual(len(result['skipped']), 2)
 
+    def test_prune_fatal_second_removal_preserves_partial_batch_result(self) -> None:
+        home = make_codex_home(self.tmp_path)
+        for name in ("a", "b", "c"):
+            make_session(
+                home,
+                f"sessions/p/rollout-batch-{name}.jsonl",
+                session_id=f"batch-{name}",
+            )
+        vault = self.tmp_path / "vault"
+        storage.archive(home, vault, older_than_days=1, execute=True)
+        ordered = sorted(storage.list_archives(vault), key=lambda item: item["archive_id"])
+        real_fsync = storage._fsync_directory
+        sync_calls = 0
+
+        def fail_second_removal_before_unlink(path: Path) -> None:
+            nonlocal sync_calls
+            sync_calls += 1
+            if sync_calls == 3:
+                raise OSError("synthetic second removal failure")
+            real_fsync(path)
+
+        inactive = {"state": "inactive", "reason": "no open file handles"}
+        with mock.patch.object(
+            storage, "probe_session_file", return_value=inactive
+        ), mock.patch.object(
+            storage, "_fsync_directory", side_effect=fail_second_removal_before_unlink
+        ), self.assertRaises(storage.BatchOperationError) as raised:
+            storage.prune(vault, execute=True)
+
+        partial = raised.exception.partial_result
+        self.assertFalse(partial["ok"])
+        self.assertEqual(partial["removed"], [ordered[0]["relative_path"]])
+        self.assertEqual(
+            partial["removed_source_bytes"], ordered[0]["raw_bytes"]
+        )
+        self.assertEqual(partial["errors"][-1]["archive_id"], ordered[1]["archive_id"])
+        self.assertIn("second removal failure", partial["errors"][-1]["reason"])
+        self.assertFalse((home / ordered[0]["relative_path"]).exists())
+        self.assertTrue((home / ordered[1]["relative_path"]).exists())
+        self.assertTrue((home / ordered[2]["relative_path"]).exists())
+
     def test_prune_batch_skips_source_changed_after_preview_and_continues(self) -> None:
         home = make_codex_home(self.tmp_path)
         sources = [
@@ -1136,6 +1212,56 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(len(result['removed']), 1)
         self.assertEqual(result['skipped'][0]['relative_path'], str(busy.relative_to(home)))
         self.assertTrue(storage.verify(vault)['ok'])
+
+    def test_archive_remove_originals_fatal_failure_preserves_partial_result(self) -> None:
+        home = make_codex_home(self.tmp_path)
+        paths = [
+            make_session(
+                home,
+                f"sessions/p/rollout-remove-{name}.jsonl",
+                session_id=f"remove-{name}",
+            )
+            for name in ("a", "b", "c")
+        ]
+        vault = self.tmp_path / "vault"
+        real_remove = storage._remove_source_atomically
+        calls = 0
+
+        def fail_second_removal(path: Path, manifest: dict[str, object]) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise storage.VaultError("synthetic fatal source removal")
+            real_remove(path, manifest)
+
+        inactive = {"state": "inactive", "reason": "no open file handles"}
+        with mock.patch.object(
+            storage, "probe_session_file", return_value=inactive
+        ), mock.patch.object(
+            storage, "_remove_source_atomically", side_effect=fail_second_removal
+        ), self.assertRaises(storage.BatchOperationError) as raised:
+            storage.archive(
+                home,
+                vault,
+                older_than_days=1,
+                execute=True,
+                remove_originals=True,
+            )
+
+        partial = raised.exception.partial_result
+        self.assertEqual(len(partial["archived"]), 3)
+        self.assertEqual(partial["removed"], [str(paths[0].relative_to(home))])
+        first_manifest = next(
+            item
+            for item in partial["archived"]
+            if item["relative_path"] == str(paths[0].relative_to(home))
+        )
+        self.assertEqual(partial["removed_source_bytes"], first_manifest["raw_bytes"])
+        self.assertEqual(partial["errors"][-1]["relative_path"], str(paths[1].relative_to(home)))
+        self.assertIn("fatal source removal", partial["errors"][-1]["reason"])
+        self.assertFalse(paths[0].exists())
+        self.assertTrue(paths[1].exists())
+        self.assertTrue(paths[2].exists())
 
     @unittest.skipUnless(shutil.which('lsof'), 'lsof is unavailable')
     def test_real_open_file_is_preserved_while_closed_source_is_pruned(self) -> None:
@@ -1426,11 +1552,17 @@ class StorageTests(unittest.TestCase):
                 side_effect=[None, OSError("post-unlink fsync failed")],
             ):
                 with self.assertRaisesRegex(
-                    storage.VaultError,
+                    storage.BatchOperationError,
                     "source was removed but removal durability could not be confirmed",
-                ):
+                ) as raised:
                     storage.prune(vault, manifest["archive_id"], execute=True)
 
+        partial = raised.exception.partial_result
+        self.assertFalse(partial["ok"])
+        self.assertEqual(partial["removed"], [manifest["relative_path"]])
+        self.assertEqual(partial["removed_source_bytes"], manifest["raw_bytes"])
+        self.assertEqual(partial["errors"][-1]["archive_id"], manifest["archive_id"])
+        self.assertTrue(partial["errors"][-1]["source_removed"])
         self.assertFalse(source.exists())
         self.assertEqual(list(source.parent.glob(".codex-vault-pending-*")), [])
         self.assertTrue(storage.verify(vault, manifest["archive_id"])["ok"])
@@ -1448,11 +1580,14 @@ class StorageTests(unittest.TestCase):
 
         manifest = self._manifest(vault)
         with mock.patch.object(storage, "probe_session_file", side_effect=guard):
-            with self.assertRaises(storage.VaultError):
+            with self.assertRaises(storage.BatchOperationError) as raised:
                 storage.prune(vault, manifest["archive_id"], execute=True)
         pending_files = list(source.parent.glob(".codex-vault-pending-*"))
         self.assertEqual(len(pending_files), 1)
         self.assertEqual(pending_files[0].read_bytes(), original + b"writer raced")
+        partial = raised.exception.partial_result
+        self.assertEqual(partial["removed"], [])
+        self.assertEqual(partial["errors"][-1]["quarantine"], str(pending_files[0]))
         self.assertFalse(source.exists())
 
     def test_session_opened_during_quarantine_is_skipped_and_source_restored(self) -> None:
@@ -1473,6 +1608,44 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(result['skipped'][0]['activity'], 'active')
         self.assertEqual(source.read_bytes(), original)
         self.assertFalse(list(source.parent.glob('.codex-vault-pending-*')))
+
+    def test_missing_pending_during_activity_probe_stops_batch_with_partial_result(self) -> None:
+        home = make_codex_home(self.tmp_path)
+        for name in ("a", "b", "c"):
+            make_session(
+                home,
+                f"sessions/p/rollout-disappears-{name}.jsonl",
+                session_id=f"disappears-{name}",
+            )
+        vault = self.tmp_path / "vault"
+        storage.archive(home, vault, older_than_days=1, execute=True)
+        ordered = sorted(storage.list_archives(vault), key=lambda item: item["archive_id"])
+        pending_probes = 0
+
+        def remove_second_pending(path: Path) -> dict[str, str]:
+            nonlocal pending_probes
+            if path.name.startswith(".codex-vault-pending-"):
+                pending_probes += 1
+                if pending_probes == 2:
+                    path.unlink()
+                    return {"state": "active", "reason": "synthetic concurrent removal"}
+            return {"state": "inactive", "reason": "no open file handles"}
+
+        with mock.patch.object(
+            storage, "probe_session_file", side_effect=remove_second_pending
+        ), self.assertRaises(storage.BatchOperationError) as raised:
+            storage.prune(vault, execute=True)
+
+        partial = raised.exception.partial_result
+        self.assertEqual(partial["removed"], [ordered[0]["relative_path"]])
+        self.assertEqual(partial["removed_source_bytes"], ordered[0]["raw_bytes"])
+        self.assertEqual(partial["errors"][-1]["archive_id"], ordered[1]["archive_id"])
+        self.assertFalse(partial["errors"][-1]["source_removed"])
+        self.assertTrue(partial["errors"][-1]["source_missing"])
+        self.assertFalse((home / ordered[0]["relative_path"]).exists())
+        self.assertFalse((home / ordered[1]["relative_path"]).exists())
+        self.assertTrue((home / ordered[2]["relative_path"]).exists())
+        self.assertTrue(storage.verify(vault)["ok"])
 
     def test_rollback_race_preserves_new_live_file_and_quarantined_archive_copy(self) -> None:
         home = make_codex_home(self.tmp_path)

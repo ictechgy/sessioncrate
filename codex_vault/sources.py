@@ -47,6 +47,12 @@ _DIAGNOSTIC_APP_ROOTS = {
 }
 _DIAGNOSTIC_LOG_LEAVES = {"rollout", "debug"}
 _NATIVE_ROOT_NAMES = {".claude", ".grok", ".gemini", ".codex", ".zcode", ".autoclaw", ".auto-claw"}
+_RECOVERY_ARTIFACT_PREFIXES = (
+    ".codex-vault-pending",
+    ".codex-vault-restore-stage-",
+    ".bundle-restore-",
+    ".vault-restore-",
+)
 _MODEL_IO_HIDDEN_CONTENT_KINDS = {
     "reasoning", "thinking", "analysis", "redacted_thinking", "redacted-thinking",
 }
@@ -69,18 +75,24 @@ class SessionGroup:
 
 def default_source_root(tool: str) -> Path | None:
     """Return a path without inspecting it or reading any configuration."""
-    if tool == "claude":
-        return Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude"))).expanduser()
-    if tool == "grok":
-        return Path(os.environ.get("GROK_HOME", str(Path.home() / ".grok"))).expanduser()
-    if tool == "gemini":
-        gemini_home = os.environ.get("GEMINI_CLI_HOME")
-        return (Path(gemini_home).expanduser() / ".gemini") if gemini_home else Path.home() / ".gemini"
-    if tool == "codex":
-        return Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
     if tool in _EXPORT_TOOLS or tool in _DIAGNOSTIC_TOOLS:
         return None
-    raise VaultError(f"unknown source tool: {tool}")
+    if tool not in _NATIVE_TOOLS:
+        raise VaultError(f"unknown source tool: {tool}")
+    try:
+        if tool == "claude":
+            configured = os.environ.get("CLAUDE_CONFIG_DIR")
+            return Path(configured).expanduser() if configured is not None else Path.home() / ".claude"
+        if tool == "grok":
+            configured = os.environ.get("GROK_HOME")
+            return Path(configured).expanduser() if configured is not None else Path.home() / ".grok"
+        if tool == "gemini":
+            configured = os.environ.get("GEMINI_CLI_HOME")
+            return (Path(configured).expanduser() / ".gemini") if configured else Path.home() / ".gemini"
+        configured = os.environ.get("CODEX_HOME")
+        return Path(configured).expanduser() if configured is not None else Path.home() / ".codex"
+    except (OSError, RuntimeError) as exc:
+        raise VaultError(f"{tool} source root could not be resolved") from exc
 
 
 def tool_catalog() -> list[dict[str, Any]]:
@@ -221,8 +233,11 @@ def _signature_covers(signature_root: Path, candidate: Path) -> bool:
 
 
 def _validate_export_root(root: Path) -> None:
-    candidate = root.resolve()
-    home = Path.home().resolve()
+    try:
+        candidate = root.resolve()
+        home = Path.home().resolve()
+    except (OSError, RuntimeError) as exc:
+        raise VaultError("export source root could not be checked") from exc
     if candidate == home or home.is_relative_to(candidate):
         raise VaultError("export source root is a native tool root or user home")
     candidate_parts = tuple(part.lower() for part in candidate.parts)
@@ -232,10 +247,17 @@ def _validate_export_root(root: Path) -> None:
         storage_index = len(candidate_parts) - 1 - candidate_parts[::-1].index("storage")
         if any(part in {"session", "message", "part"} for part in candidate_parts[storage_index + 1:]):
             raise VaultError("export source root is an OpenCode native storage path")
-    for native in _known_native_roots():
+    try:
+        native_roots = _known_native_roots()
+    except (VaultError, OSError, RuntimeError) as exc:
+        raise VaultError("export source root could not be checked") from exc
+    for native in native_roots:
         if native is None:
             continue
-        native_path = Path(native).expanduser().resolve()
+        try:
+            native_path = Path(native).expanduser().resolve()
+        except (OSError, RuntimeError) as exc:
+            raise VaultError("export source root could not be checked") from exc
         if candidate == native_path or candidate.is_relative_to(native_path) or native_path.is_relative_to(candidate):
             raise VaultError("export source root is a native tool root or its ancestor")
     probe = candidate
@@ -320,6 +342,10 @@ def _format_for(path: str, tool: str) -> str:
     return "binary"
 
 
+def _is_recovery_artifact(name: str) -> bool:
+    return any(name.startswith(prefix) for prefix in _RECOVERY_ARTIFACT_PREFIXES)
+
+
 def _walk(root: Path, start: Path, *, skip_hidden: bool = False) -> tuple[list[str], list[str]]:
     files: list[str] = []
     notes: list[str] = []
@@ -332,9 +358,13 @@ def _walk(root: Path, start: Path, *, skip_hidden: bool = False) -> tuple[list[s
             notes.append(f"unreadable directory: {_rel(root, current)}")
             continue
         for entry in entries:
+            relative = _rel(root, Path(entry.path))
+            if _is_recovery_artifact(entry.name):
+                if not skip_hidden:
+                    notes.append(f"reserved SessionCrate recovery artifact: {relative}")
+                continue
             if skip_hidden and entry.name.startswith("."):
                 continue
-            relative = _rel(root, Path(entry.path))
             try:
                 if entry.is_symlink():
                     notes.append(f"symlink member: {relative}")
@@ -457,6 +487,15 @@ def _discover_grok(root: Path) -> list[SessionGroup]:
     except OSError:
         return [_unreadable_group("grok", root, _rel(root, sessions))]
     for project in projects:
+        project_rel = _rel(root, project)
+        if _is_recovery_artifact(project.name):
+            groups.append(_discovery_warning_group(
+                "grok",
+                root,
+                [f"reserved SessionCrate recovery artifact: {project_rel}"],
+                scope=project_rel,
+            ))
+            continue
         try:
             if project.is_symlink() or not project.is_dir():
                 continue
@@ -466,7 +505,14 @@ def _discover_grok(root: Path) -> list[SessionGroup]:
             continue
         for session in sessions_in_project:
             rel = _rel(root, session)
-            if session.is_symlink():
+            if _is_recovery_artifact(session.name):
+                groups.append(_discovery_warning_group(
+                    "grok",
+                    root,
+                    [f"reserved SessionCrate recovery artifact: {rel}"],
+                    scope=rel,
+                ))
+            elif session.is_symlink():
                 groups.append(_group("grok", root, session.name, [], [rel], cwd=_decoded_cwd(project.name), notes=[f"symlink session root: {rel}"]))
             elif session.is_dir():
                 files, notes = _walk(root, session)
@@ -605,12 +651,45 @@ def _clean_text(value: str) -> str:
     return _CONTROL_CHARS.sub(" ", value).strip()
 
 
+_KEY_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+_CREDENTIAL_KEY_SEGMENTS = {
+    "authorization", "cookie", "cookies", "credential", "credentials",
+    "header", "headers", "password", "passwd", "secret", "secrets",
+}
+_TOKEN_KEY_QUALIFIERS = {
+    "access", "api", "auth", "authentication", "bearer", "csrf", "id",
+    "oauth", "refresh", "session", "value", "verification",
+}
+
+
+def _credential_key(key: str) -> bool:
+    separated = _KEY_BOUNDARY.sub("_", key)
+    segments = tuple(part for part in re.split(r"[^a-z0-9]+", separated.casefold()) if part)
+    if not segments:
+        return False
+    if len(segments) == 1 and segments[0] in {
+        "apikey", "authorization", "cookie", "cookies", "credential",
+        "credentials", "password", "passwd", "secret", "secrets", "token",
+        "tokens",
+    }:
+        return True
+    if any(segment in _CREDENTIAL_KEY_SEGMENTS for segment in segments):
+        return True
+    segment_set = set(segments)
+    if segment_set.intersection({"token", "tokens"}) and segment_set.intersection(_TOKEN_KEY_QUALIFIERS):
+        return True
+    for index, segment in enumerate(segments):
+        if segment == "key" and index > 0 and segments[index - 1] in {"api", "private", "secret"}:
+            return True
+    return False
+
+
 def _structured_text(value: Any, depth: int = 0, key: str = "") -> list[str]:
     """Read bounded tool arguments without serializing opaque payloads."""
     if depth > 6:
         return []
     lower_key = key.lower()
-    if lower_key in {"data", "basedata", "base64", "image", "image_url", "inlinedata", "token", "password", "secret"}:
+    if _credential_key(key) or lower_key in {"data", "basedata", "base64", "image", "image_url", "inlinedata"}:
         return []
     if isinstance(value, str):
         text = _clean_text(value)
@@ -672,7 +751,11 @@ _MODEL_IO_HIDDEN_KEY_PARTS = (
 
 def _model_io_hidden_key(key: str) -> bool:
     lower = key.casefold().replace("-", "_")
-    return lower in {"data", "media", "image", "images"} or any(part in lower for part in _MODEL_IO_HIDDEN_KEY_PARTS)
+    return (
+        _credential_key(key)
+        or lower in {"data", "media", "image", "images"}
+        or any(part in lower for part in _MODEL_IO_HIDDEN_KEY_PARTS)
+    )
 
 
 def _model_io_hidden_content_kind(kind: Any) -> bool:

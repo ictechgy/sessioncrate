@@ -33,6 +33,14 @@ class VaultError(RuntimeError):
     """A user-actionable storage or safety failure."""
 
 
+class BatchOperationError(VaultError):
+    """A fatal batch failure with the results completed before it stopped."""
+
+    def __init__(self, message: str, partial_result: dict[str, Any]):
+        self.partial_result = partial_result
+        super().__init__(message)
+
+
 class SessionActivityBlocked(VaultError):
     """One selected source is in use or cannot be checked; preserve it."""
 
@@ -43,6 +51,23 @@ class SessionActivityBlocked(VaultError):
 
 class _SourceRemovalSkipped(VaultError):
     """A pre-quarantine source check failed without changing the source."""
+
+
+class _SourceRemovalStateError(VaultError):
+    """A fatal removal failure with an explicit source recovery state."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        source_removed: bool,
+        source_missing: bool | None = None,
+        quarantine: str | None = None,
+    ):
+        self.source_removed = source_removed
+        self.source_missing = source_missing
+        self.quarantine = quarantine
+        super().__init__(message)
 
 
 _PRIVATE_DIR = 0o700
@@ -1403,9 +1428,9 @@ def archive(
         "skipped": [],
         "removed_source_bytes": 0,
         "errors": [],
+        "remove_originals_requested": bool(remove_originals),
     }
     if not execute:
-        result["remove_originals_requested"] = bool(remove_originals)
         return result
     if not eligible:
         return result
@@ -1457,6 +1482,8 @@ def archive(
                         "reason": str(error),
                     })
                     continue
+                except (VaultError, OSError) as error:
+                    raise _batch_removal_error(result, manifest, error) from error
                 result["removed"].append(manifest["relative_path"])
                 result["removed_source_bytes"] += manifest["raw_bytes"]
     return result
@@ -1580,7 +1607,7 @@ def restore(
     vault = _safe_vault(vault_dir, create=False)
     if vault is None:
         raise VaultError("vault does not exist")
-    with _vault_lock(vault, exclusive=True, create=False):
+    with _vault_lock(vault, exclusive=bool(execute), create=False):
         manifest = _resolve_archive_unlocked(vault, archive_id)
         check = _verify_one(vault, manifest)
         if not check["ok"]:
@@ -1818,9 +1845,11 @@ def _remove_source_atomically(path: Path, manifest: dict[str, Any]) -> None:
         _fsync_directory(path.parent)
     except Exception as exc:
         if pending_removed:
-            raise VaultError(
+            raise _SourceRemovalStateError(
                 "source was removed but removal durability could not be confirmed; "
-                f"verified archive retained for restore: {path}: {exc}"
+                f"verified archive retained for restore: {path}: {exc}",
+                source_removed=True,
+                source_missing=True,
             ) from exc
         # Never overwrite a path that appeared while the source was quarantined,
         # and never move a changed or symlink replacement back into it.  A
@@ -1837,10 +1866,62 @@ def _remove_source_atomically(path: Path, manifest: dict[str, Any]) -> None:
                     _restore_quarantined_source_no_replace(pending, path, pending_identity)
                 else:
                     raise VaultError(f"source retained in quarantine for recovery: {pending}")
-        except VaultError:
+            restored, restore_reason = _source_matches_manifest(path, manifest)
+            if not restored:
+                try:
+                    source_missing = _lstat(path) is None
+                except OSError:
+                    source_missing = None
+                try:
+                    pending_after = _lstat(pending)
+                    quarantine = str(pending) if pending_after is not None else None
+                except OSError:
+                    quarantine = str(pending)
+                raise _SourceRemovalStateError(
+                    f"source recovery could not be verified after quarantine failure: {path}: {restore_reason}",
+                    source_removed=False,
+                    source_missing=source_missing,
+                    quarantine=quarantine,
+                )
+        except _SourceRemovalStateError:
             raise
+        except VaultError as rollback_error:
+            try:
+                pending_after = _lstat(pending)
+                quarantine = str(pending) if pending_after is not None else None
+            except OSError:
+                quarantine = str(pending)
+            try:
+                source_missing = _lstat(path) is None
+            except OSError:
+                source_missing = None
+            raise _SourceRemovalStateError(
+                str(rollback_error),
+                source_removed=False,
+                source_missing=source_missing,
+                quarantine=quarantine,
+            ) from rollback_error
         except OSError as rollback_exc:
-            raise VaultError(f"source retained in quarantine for recovery: {pending}: {rollback_exc}") from exc
+            try:
+                source_missing = _lstat(path) is None
+            except OSError:
+                source_missing = None
+            try:
+                pending_after = _lstat(pending)
+                quarantine = str(pending) if pending_after is not None else None
+            except OSError:
+                quarantine = str(pending)
+            message = (
+                f"source retained in quarantine for recovery: {pending}: {rollback_exc}"
+                if quarantine is not None
+                else f"source restored but recovery durability could not be confirmed: {path}: {rollback_exc}"
+            )
+            raise _SourceRemovalStateError(
+                message,
+                source_removed=False,
+                source_missing=source_missing,
+                quarantine=quarantine,
+            ) from exc
         if isinstance(exc, VaultError):
             raise
         raise VaultError(f"source removal failed; source restored: {path}: {exc}") from exc
@@ -1854,6 +1935,33 @@ def _require_session_inactive(path: Path) -> None:
             state if state in {"active", "unknown"} else "unknown",
             str(result.get("reason") or "could not establish selected session file inactivity"),
         )
+
+
+def _batch_removal_error(
+    result: dict[str, Any],
+    manifest: dict[str, Any],
+    error: VaultError | OSError,
+) -> BatchOperationError:
+    """Record a fatal removal state and return the fail-stop batch error."""
+
+    detail: dict[str, Any] = {
+        "archive_id": manifest["archive_id"],
+        "relative_path": manifest["relative_path"],
+        "reason": str(error),
+    }
+    if isinstance(error, _SourceRemovalStateError):
+        detail["source_removed"] = error.source_removed
+        if error.source_missing is not None:
+            detail["source_missing"] = error.source_missing
+        if error.quarantine is not None:
+            detail["quarantine"] = error.quarantine
+        if error.source_removed:
+            result["removed"].append(manifest["relative_path"])
+            result["removed_source_bytes"] += manifest["raw_bytes"]
+    result.setdefault("errors", []).append(detail)
+    if "ok" in result:
+        result["ok"] = False
+    return BatchOperationError(str(error), result)
 
 
 def prune(vault_dir: Path, archive_id: str | None = None, execute: bool = False) -> dict[str, Any]:
@@ -1898,6 +2006,7 @@ def prune(vault_dir: Path, archive_id: str | None = None, execute: bool = False)
             "candidates": entries,
             "removed": [],
             "skipped": [entry for entry in entries if not entry["eligible"]],
+            "errors": [],
             "removed_source_bytes": 0,
         }
         if not execute:
@@ -1922,6 +2031,10 @@ def prune(vault_dir: Path, archive_id: str | None = None, execute: bool = False)
                     entry.update(eligible=False, reason=str(error))
                     result["skipped"].append(entry)
                     continue
+                except (VaultError, OSError) as error:
+                    raise _batch_removal_error(
+                        result, by_id[entry["archive_id"]], error
+                    ) from error
                 result["removed"].append(entry["relative_path"])
                 result["removed_source_bytes"] += by_id[entry["archive_id"]]["raw_bytes"]
         return result

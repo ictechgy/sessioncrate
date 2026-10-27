@@ -57,7 +57,9 @@ sessioncrate prune --tool codex --execute
 
 `archive --execute --remove-originals` combines those operations. Originals are removed only after the integrity, source, and activity checks pass. Selected recent, changed, open, unsafe, or unverifiable originals are preserved. Other sessions may remain running; `lsof` checks open file descriptors, not an application's logical session state. Do not reopen the selected session during cleanup. See [compatibility and evidence](docs/compatibility.md) for native resume limits and [release preparation](docs/release.md) for the alpha boundary.
 
-An archive candidate that fails before its manifest is published is reported in `errors`, and the CLI exits with status `2`; other eligible candidates may still be published. Preservation decisions after publication, such as a changed, open, unsafe, or unverifiable original, are reported in `skipped` and do not mean that the archive itself failed.
+Candidate preparation failures appear in `errors`, and the CLI exits with status `2`; other eligible candidates may still be published. For grouped adapters, a failure after blob publication starts stops the batch before original removal. Already-published artifacts are preserved for verification and recovery. Preservation decisions after a successful archive, such as a changed, open, unsafe, or unverifiable original, appear in `skipped`. If a quarantine remains, human output and JSON identify its recovery path.
+
+An interrupted batch returns completed work alongside `partial: true`, `ok: false`, and `error`, with status `2`. Check its `archived`, `removed`, `skipped`, and `errors` entries before retrying.
 
 `prune` first performs inexpensive source existence, type, and metadata checks; bundle pruning also checks source age before reading historical archive blobs. A source that is missing or changed can therefore be skipped without reading its historical archive blob; use `verify` when you need whole-vault archive integrity. Batch pruning fails closed if a recognized manifest is malformed. Keep the damaged record for recovery and use the full ID of an intact archive. `--tool codex` can avoid the bundle namespace, but a bundle tool filter still inspects the shared bundle manifest namespace and cannot isolate every damaged manifest; an unreadable namespace cannot be bypassed by a tool filter.
 
@@ -112,7 +114,11 @@ sessioncrate show ARCHIVE_ID --limit 30
 
 Search performs literal, Unicode case-insensitive substring matching. It streams compressed archive members and does not create a second plaintext transcript store. Results include the archive ID, project, source member or record location, and bounded context. Use project and session filters to narrow the archives searched. `--limit` bounds the number of returned results, not the verification work: each archive read is checked through its end, even after enough matches are found.
 
+All-tool search interleaves Codex and grouped results before applying `--limit`, so one backend cannot fill every available result slot when the limit allows both. Within each backend, result order is retained.
+
 Unknown, binary, image, encrypted, or oversized records may be skipped by the text reader while their original bytes remain archived. JSONL records over 1 MiB and JSON documents over 32 MiB are skipped by the relevant readers; inspect `skipped_records` when an empty result matters. For JSON documents, `line` is a message ordinal rather than a physical file line.
+
+Grouped-session readers omit recognized credential and header fields from structured tool arguments. Free text and raw archive bytes are not universally redacted.
 
 For Codex `.jsonl.zst`, the original compressed source bytes are hashed and retained byte-for-byte inside the vault. The archive records the decoded byte count only to validate streaming search; it does not keep a second plaintext copy and does not promise additional compression savings. Searching or showing that content requires Python 3.14 or later. On older supported versions, byte-preserving scan, listing, statistics, verification, restoration, and pruning remain available, with a clear capability error for operations that need to decode the Zstandard content.
 
@@ -132,6 +138,8 @@ A unique archive-ID prefix is accepted. SHA-256 and compressed/member integrity 
 `list` reports valid entries alongside manifest errors, and `verify` aggregates failures. If one archive namespace cannot be searched, `search` returns healthy namespaces' matches with `partial: true` and `errors`; human output also identifies the failed namespace. When `list` has errors, its valid rows include full archive IDs so an intact entry can still be selected. An unrelated damaged manifest does not block full-ID recovery of an intact archive. A damaged matching prefix requires the full intact ID. `--tool codex` can avoid an unrelated bundle namespace, but a bundle tool filter still encounters malformed manifests in the shared bundle namespace, and no tool filter can bypass an unreadable namespace. Integrity and operational errors, including partial searches, return exit code `2`.
 
 Grouped restore uses a private staging directory near the destination. A failed restore cleans up only files and directories created by that attempt after filesystem identity checks; pre-existing, shared, or raced destination directories are left alone. A crash can leave a `.codex-vault-restore-stage-*` plaintext staging directory; source-side archive or prune failures can also retain a quarantine for recovery. These paths are outside the vault's stats accounting and there is no automatic crash scavenger or quarantine cleanup. Multiple session roots are not published as one filesystem transaction. Compression is not encryption.
+
+Native discovery recognizes SessionCrate recovery artifacts and preserves them outside new archive candidates. A session containing one is reported as ineligible; retain the artifact and its archive for recovery.
 
 Gzip and bundle tar decoding stop when the declared source or bundle size is exceeded. Bundle limits include the normal PAX metadata overhead emitted by SessionCrate. These bounds stop a mismatched archive from being decoded indefinitely; they are not a general disk quota and do not provide a universal zip-bomb guarantee.
 

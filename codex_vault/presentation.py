@@ -43,7 +43,12 @@ def _diagnostics(items, title='Errors'):
     if not items:
         return
     print(f'{title}: {len(items)}')
-    _details(items, lambda item: f"{_label(item)}: {_clean(item.get('reason') or item.get('error') or 'unavailable')}")
+    def row(item):
+        text = f"{_label(item)}: {_clean(item.get('reason') or item.get('error') or 'unavailable')}"
+        if item.get('quarantine'):
+            text += f"\n    Recovery quarantine: {_clean(item['quarantine'])}"
+        return text
+    _details(items, row)
 
 
 def _archive_row(item, *, full_id=False):

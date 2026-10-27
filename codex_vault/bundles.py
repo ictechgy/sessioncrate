@@ -36,12 +36,28 @@ VaultError = storage.VaultError
 class _QuarantineRemovalStarted(VaultError):
     """Deletion began; retain quarantine rather than restore a partial group."""
 
+
+class _BundleRecoveryStateError(VaultError):
+    """Rollback could not account for every quarantined source root."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        source_missing: bool | None,
+        quarantine: str | None,
+    ):
+        self.source_missing = source_missing
+        self.quarantine = quarantine
+        super().__init__(message)
+
 _PRIVATE_DIR = 0o700
 _PRIVATE_FILE = 0o600
 _DAY_NS = 86_400 * 1_000_000_000
 _HOUR_NS = 3_600 * 1_000_000_000
 _HEX64 = set("0123456789abcdef")
 _ARCHIVE_ID_LEN = 64
+_BLOB_SUFFIX = ".tar.gz"
 _MAX_MANIFEST_FILES = 100_000
 _MAX_MANIFEST_DIRECTORIES = 100_000
 _MAX_MANIFEST_BYTES = 32 * 1024 * 1024
@@ -150,6 +166,15 @@ def _temporary_file_stats(directory: Path | None, prefix: str) -> tuple[int, int
             logical_bytes += int(item.st_size)
             allocated_bytes += int(getattr(item, "st_blocks", 0)) * 512
     return count, logical_bytes, allocated_bytes
+
+
+def _is_published_blob_name(name: str) -> bool:
+    """Return whether a directory entry has the canonical published blob name."""
+
+    if not isinstance(name, str) or not name.endswith(_BLOB_SUFFIX):
+        return False
+    digest = name[: -len(_BLOB_SUFFIX)]
+    return len(digest) == _ARCHIVE_ID_LEN and not (set(digest) - _HEX64)
 
 
 def _manifest_path(bundle_root: Path, archive_id: str) -> Path:
@@ -854,8 +879,6 @@ def _stream_verified_blob(
     except VaultError:
         raise
     except (OSError, tarfile.TarError, EOFError, ValueError, zlib.error) as exc:
-        if isinstance(exc, VaultError):
-            raise
         raise VaultError("bundle tar.gz is corrupt") from exc
     finally:
         if fd >= 0:
@@ -969,7 +992,20 @@ def _group_candidates(tool: str, source_root: Path, older_than_days: int) -> lis
                 "_group": group,
             })
         except (VaultError, OSError) as exc:
-            result.append({"tool": group.tool, "source_root": str(root), "session_id": str(group.session_id), "files": [], "root_entries": [], "source_bytes": 0, "eligible": False, "reason": str(exc), "_group": group})
+            result.append({
+                "tool": group.tool,
+                "source_root": str(root),
+                "session_id": str(group.session_id),
+                "cwd": str(getattr(group, "cwd", "")),
+                "source_mode": str(getattr(group, "source_mode", "")),
+                "files": [],
+                "root_entries": [],
+                "source_bytes": 0,
+                "mtime_ns": 0,
+                "eligible": False,
+                "reason": str(exc),
+                "_group": group,
+            })
     return result
 
 
@@ -978,6 +1014,26 @@ def scan(tool: str, source_root: Path, older_than_days: int = 30) -> dict[str, A
     for candidate in candidates:
         candidate.pop("_group", None)
     return {"tool": tool, "source_root": str(_absolute(source_root)), "older_than_days": older_than_days, "candidates": candidates, "source_bytes": sum(item["source_bytes"] for item in candidates if item["eligible"])}
+
+
+def _batch_removal_error(
+    result: dict[str, Any], manifest: dict[str, Any], error: VaultError | OSError
+) -> storage.BatchOperationError:
+    detail: dict[str, Any] = {
+        "tool": manifest["tool"],
+        "session_id": manifest["session_id"],
+        "archive_id": manifest["archive_id"],
+        "reason": str(error),
+    }
+    if isinstance(error, _BundleRecoveryStateError):
+        if error.source_missing is not None:
+            detail["source_missing"] = error.source_missing
+        if error.quarantine is not None:
+            detail["quarantine"] = error.quarantine
+    result["errors"].append(detail)
+    if "ok" in result:
+        result["ok"] = False
+    return storage.BatchOperationError(str(error), result)
 
 
 def archive(
@@ -1007,6 +1063,8 @@ def archive(
             group = candidate["_group"]
             temp: Path | None = None
             publication_started = False
+            fatal_cause: VaultError | OSError | None = None
+            fatal_reason = ""
             try:
                 temp, directories, files, compressed_size, compressed_sha, metadata_prefix = _snapshot_bundle(
                     Path(candidate["source_root"]), group, bundle_root / "blobs"
@@ -1046,8 +1104,6 @@ def archive(
                     raise VaultError(checked["error"])
                 result["archived"].append(published)
             except (VaultError, OSError) as exc:
-                if publication_started:
-                    raise
                 result["errors"].append(
                     {
                         "tool": candidate["tool"],
@@ -1055,12 +1111,31 @@ def archive(
                         "reason": str(exc),
                     }
                 )
+                if publication_started:
+                    fatal_cause = exc
+                    fatal_reason = str(exc)
             finally:
                 if temp is not None:
-                    temp.unlink(missing_ok=True)
+                    try:
+                        temp.unlink(missing_ok=True)
+                    except OSError as exc:
+                        cleanup_reason = f"temporary bundle cleanup failed: {exc}"
+                        result["errors"][-1]["reason"] = (
+                            f"{result['errors'][-1]['reason']}; {cleanup_reason}"
+                        )
+                        if fatal_cause is None:
+                            fatal_cause = exc
+                            fatal_reason = cleanup_reason
+                        else:
+                            fatal_reason = f"{fatal_reason}; {cleanup_reason}"
+            if fatal_cause is not None:
+                raise storage.BatchOperationError(fatal_reason, result) from fatal_cause
         if remove_originals:
             for manifest in result["archived"]:
-                _prune_one(vault, bundle_root, manifest, result)
+                try:
+                    _prune_one(vault, bundle_root, manifest, result)
+                except (VaultError, OSError) as exc:
+                    raise _batch_removal_error(result, manifest, exc) from exc
     return result
 
 
@@ -1276,7 +1351,6 @@ def _stage_restore_bundle(
         stage_parent = stage_parent.parent
     stage_parent = storage._require_directory(stage_parent, label="restore staging parent")
     stage = Path(tempfile.mkdtemp(prefix=".codex-vault-restore-stage-", dir=stage_parent))
-    os.chmod(stage, _PRIVATE_DIR)
     try:
         blob = bundle_root.parent / manifest["blob"]
         _total, staged = _stream_verified_blob(blob, manifest, stage_root=stage)
@@ -1383,7 +1457,7 @@ def restore(vault_dir: Path, archive_id: str, destination_home: Path | None = No
     vault = storage._safe_vault(vault_dir, create=False)
     if vault is None:
         raise VaultError("vault does not exist")
-    with storage._vault_lock(vault, exclusive=True, create=False):
+    with storage._vault_lock(vault, exclusive=bool(execute), create=False):
         bundle_root = _bundle_root(vault, create=False)
         if bundle_root is None:
             raise VaultError("bundle namespace does not exist")
@@ -1406,6 +1480,34 @@ def restore(vault_dir: Path, archive_id: str, destination_home: Path | None = No
             if not check["ok"]:
                 raise VaultError(check["error"])
             return result
+        if len(equal) == len(manifest["files"]):
+            initial_identities = {
+                relative: trusted_files[relative]
+                for relative in equal
+                if relative in trusted_files
+            }
+            check = _verify_blob(bundle_root, manifest)
+            if not check["ok"]:
+                raise VaultError(check["error"])
+            verified_equal = _restore_preflight(root, manifest, trusted_files)
+            stable = len(verified_equal) == len(manifest["files"])
+            if stable:
+                for entry in manifest["files"]:
+                    target = root.joinpath(*PurePosixPath(entry["path"]).parts)
+                    current = _lstat(target)
+                    if (
+                        current is None
+                        or not stat.S_ISREG(current.st_mode)
+                        or stat.S_ISLNK(current.st_mode)
+                        or _identity_stat(current) != initial_identities.get(entry["path"])
+                    ):
+                        stable = False
+                        break
+            if stable:
+                result["skipped"] = list(verified_equal)
+                return result
+            equal = verified_equal
+            result["skipped"] = list(equal)
         stage, staged = _stage_restore_bundle(bundle_root, manifest, root)
         published_files: list[tuple[Path, tuple[int, int, int, int, int, int]]] = []
         created_directories: list[dict[str, Any]] = []
@@ -1805,11 +1907,54 @@ def _move_no_replace(source: Path, target: Path) -> bool:
     return True
 
 
+def _quarantine_hint(quarantine: Path) -> str | None:
+    try:
+        return str(quarantine) if _lstat(quarantine) is not None else None
+    except OSError:
+        return str(quarantine)
+
+
+def _recovery_has_reappeared_original(
+    moved: list[tuple[Path, Path]],
+    quarantine: Path,
+    *,
+    verified_originals: set[Path] | None = None,
+) -> bool:
+    """Require every moved root to exist at its original or staged path."""
+
+    verified_originals = verified_originals or set()
+    reappeared = False
+    for original, staged in moved:
+        try:
+            original_stat = _lstat(original)
+            staged_stat = _lstat(staged)
+        except OSError as exc:
+            raise _BundleRecoveryStateError(
+                f"bundle source recovery state could not be inspected: {original}",
+                source_missing=None,
+                quarantine=_quarantine_hint(quarantine),
+            ) from exc
+        if original_stat is None and staged_stat is None:
+            raise _BundleRecoveryStateError(
+                f"bundle source root disappeared during quarantine recovery: {original}",
+                source_missing=True,
+                quarantine=_quarantine_hint(quarantine),
+            )
+        if staged_stat is None and original not in verified_originals:
+            raise _BundleRecoveryStateError(
+                f"bundle staged root disappeared and the replacement source is unverified: {original}",
+                source_missing=False,
+                quarantine=_quarantine_hint(quarantine),
+            )
+        reappeared = reappeared or original_stat is not None
+    return reappeared
+
+
 def _restore_quarantine(moved: list[tuple[Path, Path]], quarantine: Path, result: dict[str, Any], reason: str) -> bool:
     skipped = {"archive_id": result.get("archive_id", ""), "activity": "unknown", "reason": reason}
     # If any original root has reappeared, keep every moved root together so a
     # newly-created path is never overwritten and rollback is never partial.
-    if any(_lstat(original) is not None for original, _ in moved):
+    if _recovery_has_reappeared_original(moved, quarantine):
         skipped["quarantine"] = str(quarantine)
         result["skipped"].append(skipped)
         return False
@@ -1821,11 +1966,21 @@ def _restore_quarantine(moved: list[tuple[Path, Path]], quarantine: Path, result
 
         ordered = sorted(moved, key=recovery_order)
         for original, staged in ordered:
-            if _lstat(staged) is not None:
-                if not _move_no_replace(staged, original):
-                    raise FileExistsError(errno.EEXIST, "source path reappeared during rollback", str(original))
-                restored.append((original, staged))
-    except (OSError, VaultError):
+            staged_stat = _lstat(staged)
+            if staged_stat is None:
+                try:
+                    source_missing = _lstat(original) is None
+                except OSError:
+                    source_missing = None
+                raise _BundleRecoveryStateError(
+                    f"bundle staged root disappeared during quarantine recovery: {staged}",
+                    source_missing=source_missing,
+                    quarantine=_quarantine_hint(quarantine),
+                )
+            if not _move_no_replace(staged, original):
+                raise FileExistsError(errno.EEXIST, "source path reappeared during rollback", str(original))
+            restored.append((original, staged))
+    except (OSError, VaultError) as exc:
         # A multi-root rollback can fail halfway. Move already-restored roots
         # back into quarantine where possible so the recovery state remains
         # grouped and no later root is silently abandoned.
@@ -1835,6 +1990,13 @@ def _restore_quarantine(moved: list[tuple[Path, Path]], quarantine: Path, result
                     _move_no_replace(original, staged)
             except (OSError, VaultError):
                 pass
+        _recovery_has_reappeared_original(
+            moved,
+            quarantine,
+            verified_originals={original for original, _staged in restored},
+        )
+        if isinstance(exc, _BundleRecoveryStateError):
+            raise
         skipped["quarantine"] = str(quarantine)
         result["skipped"].append(skipped)
         return False
@@ -1973,6 +2135,8 @@ def _prune_one(vault: Path, bundle_root: Path, manifest: dict[str, Any], result:
         _remove_quarantine_exact(quarantine, manifest)
         deletion_completed = True
         storage._fsync_directory(parent)
+    except _BundleRecoveryStateError:
+        raise
     except _QuarantineRemovalStarted as exc:
         result["skipped"].append(
             {
@@ -1991,7 +2155,7 @@ def _prune_one(vault: Path, bundle_root: Path, manifest: dict[str, Any], result:
                 f"bundle source was removed but parent directory durability is uncertain: {parent}"
             ) from exc
         result["archive_id"] = manifest["archive_id"]
-        _restore_quarantine(moved, quarantine, result, "bundle prune failed; quarantine retained for recovery")
+        _restore_quarantine(moved, quarantine, result, "bundle prune failed during source transition")
         return
     result["removed"].append(manifest["archive_id"])
     result["removed_source_bytes"] += manifest["raw_bytes"]
@@ -2032,13 +2196,17 @@ def prune(vault_dir: Path, archive_id: str | None = None, execute: bool = False,
                 candidates.append({"archive_id": manifest["archive_id"], "eligible": eligible, "activity": state, "reason": "eligible" if eligible else reason})
             except VaultError as exc:
                 candidates.append({"archive_id": manifest["archive_id"], "eligible": False, "reason": str(exc)})
-        result: dict[str, Any] = {"ok": True, "execute": bool(execute), "executed": bool(execute), "candidates": candidates, "removed": [], "skipped": [item for item in candidates if not item["eligible"]], "removed_source_bytes": 0}
+        result: dict[str, Any] = {"ok": True, "execute": bool(execute), "executed": bool(execute), "candidates": candidates, "removed": [], "skipped": [item for item in candidates if not item["eligible"]], "errors": [], "removed_source_bytes": 0}
         if not execute:
             return result
         by_id = {manifest["archive_id"]: manifest for manifest in manifests}
         for candidate in candidates:
             if candidate["eligible"]:
-                _prune_one(vault, bundle_root, by_id[candidate["archive_id"]], result)
+                manifest = by_id[candidate["archive_id"]]
+                try:
+                    _prune_one(vault, bundle_root, manifest, result)
+                except (VaultError, OSError) as exc:
+                    raise _batch_removal_error(result, manifest, exc) from exc
         return result
 
 
@@ -2099,6 +2267,8 @@ def search(vault_dir: Path, query: str, limit: int = 20, project: str | None = N
 def show(vault_dir: Path, archive_id: str, limit: int = 100, query: str | None = None) -> dict[str, Any]:
     if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
         raise VaultError("limit must be greater than zero")
+    if query is not None and (not isinstance(query, str) or not query.strip()):
+        raise VaultError("query must not be blank")
     folded_query = query.casefold() if query is not None else None
     vault = storage._safe_vault(vault_dir, create=False)
     if vault is None:
@@ -2161,7 +2331,7 @@ def stats(vault_dir: Path, tool: str | None = None) -> dict[str, Any]:
                 blob_stats.append(storage._safe_regular(vault / relative, label="bundle blob"))
         else:
             for entry in os.scandir(bundle_root / "blobs"):
-                if entry.name.startswith(".bundle-") or not entry.name.endswith(".tar.gz"):
+                if not _is_published_blob_name(entry.name):
                     continue
                 entry_stat = entry.stat(follow_symlinks=False)
                 if stat.S_ISREG(entry_stat.st_mode) and not stat.S_ISLNK(entry_stat.st_mode):

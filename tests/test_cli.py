@@ -246,6 +246,52 @@ class CLITests(unittest.TestCase):
         self.assertEqual(len(bundles.list_archives(self.vault)), 1)
         self.assertEqual(len(list(home.glob('*.txt'))), 2)
 
+    def test_fatal_bundle_publication_reports_completed_work_and_preserves_originals(self):
+        from codex_vault import bundles, cli, storage
+        exports = self.base / 'partial publication'
+        exports.mkdir()
+        originals = {}
+        old = time.time() - 60 * 86400
+        for name in ('a-healthy', 'b-failure', 'c-later'):
+            path = exports / f'{name}.txt'
+            payload = f'synthetic {name}\n'.encode()
+            path.write_bytes(payload)
+            os.utime(path, (old, old))
+            originals[path] = payload
+        publish = bundles._write_manifest_atomic
+
+        def fail_second(path, manifest):
+            if manifest['session_id'] == 'b-failure':
+                raise storage.VaultError('synthetic manifest publication failed')
+            return publish(path, manifest)
+
+        for json_output in (True, False):
+            with self.subTest(json_output=json_output):
+                vault = self.base / f'partial-vault-{json_output}'
+                output, errors = io.StringIO(), io.StringIO()
+                args = ['--vault', str(vault), '--tool', 'export', '--source-root', str(exports)]
+                if json_output:
+                    args.append('--json')
+                with mock.patch.object(bundles, '_write_manifest_atomic', side_effect=fail_second), \
+                     contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                    status = cli.main([*args, 'archive', '--older-than', '0', '--execute', '--remove-originals'])
+                self.assertEqual(status, 2)
+                if json_output:
+                    result = json.loads(output.getvalue())
+                    self.assertTrue(result['partial'])
+                    self.assertFalse(result['ok'])
+                    self.assertEqual([item['session_id'] for item in result['archived']], ['a-healthy'])
+                    self.assertEqual(result['errors'][0]['session_id'], 'b-failure')
+                    self.assertEqual(result['removed'], [])
+                    self.assertIn('synthetic manifest publication failed', result['error'])
+                else:
+                    self.assertIn('Operation stopped', output.getvalue())
+                    self.assertIn('Archived 1', output.getvalue())
+                    self.assertIn('Errors: 1', output.getvalue())
+                self.assertEqual([item['session_id'] for item in bundles.list_archives(vault)], ['a-healthy'])
+                for path, payload in originals.items():
+                    self.assertEqual(path.read_bytes(), payload)
+
     def test_codex_search_does_not_read_unselected_bundle_manifests(self):
         self.run_cli('archive', '--execute')
         manifests = self.vault / 'bundles/manifests'
@@ -272,6 +318,22 @@ class CLITests(unittest.TestCase):
         self.assertIn('한글', human.stdout)
         self.assertIn('Partial results', human.stdout)
         self.assertIn('bundles', human.stdout)
+
+    def test_all_tool_search_interleaves_namespaces_before_limit(self):
+        from codex_vault import bundles
+        second = self.source.with_name('rollout-second.jsonl')
+        second.write_bytes(self.raw)
+        old = time.time() - 60 * 86400
+        os.utime(second, (old, old))
+        self.run_cli('archive', '--execute')
+        exports = self.base / 'search exports'
+        exports.mkdir()
+        (exports / 'chat.txt').write_text('한글 bundle result', encoding='utf-8')
+        bundles.archive('export', exports, self.vault, older_than_days=0, execute=True)
+        result = json.loads(self.run_cli('search', '한글', '--limit', '2').stdout)
+        self.assertEqual([hit['tool'] for hit in result['matches']], ['codex', 'export'])
+        self.assertTrue(result['truncated'])
+        self.assertFalse(result['partial'])
 
     def test_verify_missing_vault_is_an_error(self):
         result = self.run_cli('verify', success=False)
@@ -473,6 +535,19 @@ class CLITests(unittest.TestCase):
         self.assertIn('failed-session: synthetic disk full', text)
         self.assertIn('Originals preserved: 1', text)
         self.assertIn('session file is open', text)
+
+    def test_human_prune_shows_retained_quarantine_recovery_path(self):
+        from codex_vault.cli import _print_human
+        output = io.StringIO()
+        quarantine = '/synthetic/project/.pending-recovery\nforged status'
+        with contextlib.redirect_stdout(output):
+            _print_human({'executed': True, 'removed': [], 'removed_source_bytes': 0,
+                          'candidates': [], 'skipped': [{'archive_id': 'a' * 64,
+                          'reason': 'source path reappeared', 'quarantine': quarantine}]}, command='prune')
+        text = output.getvalue()
+        self.assertIn('Recovery quarantine:', text)
+        self.assertIn(r'/synthetic/project/.pending-recovery\nforged status', text)
+        self.assertNotIn('\nforged status', text)
 
     def test_direct_human_renderer_preserves_execution_state_and_backend_shapes(self):
         from codex_vault.cli import _print_human

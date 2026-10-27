@@ -87,16 +87,22 @@ def install(bin_dir, skills_dir, *, execute=False, legacy_aliases=False):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--bin-dir', type=Path, default=Path.home() / '.local/bin')
-    parser.add_argument('--skills-dir', type=Path, default=Path.home() / '.agents/skills')
+    parser.add_argument('--bin-dir', type=Path)
+    parser.add_argument('--skills-dir', type=Path)
     parser.add_argument('--execute', action='store_true', help='Create launchers; otherwise preview only')
     parser.add_argument('--legacy-aliases', action='store_true',
                         help='Also install the old codex-vault launcher and skill aliases')
     args = parser.parse_args(argv)
     try:
-        print(json.dumps(install(args.bin_dir, args.skills_dir, execute=args.execute,
+        default_home = Path.home() if args.bin_dir is None or args.skills_dir is None else None
+        bin_dir = args.bin_dir if args.bin_dir is not None else default_home / '.local/bin'
+        skills_dir = args.skills_dir if args.skills_dir is not None else default_home / '.agents/skills'
+        print(json.dumps(install(bin_dir, skills_dir, execute=args.execute,
                                  legacy_aliases=args.legacy_aliases), ensure_ascii=False, indent=2))
         return 0
+    except RuntimeError:
+        print('Error: Installation home could not be expanded; set --bin-dir and --skills-dir explicitly.', file=sys.stderr)
+        return 2
     except (ValueError, OSError) as error:
         print(f'Error: {error}', file=sys.stderr)
         return 2

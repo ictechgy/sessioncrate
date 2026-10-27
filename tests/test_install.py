@@ -1,5 +1,7 @@
 import json
+import contextlib
 import importlib.util
+import io
 from pathlib import Path
 import subprocess
 import sys
@@ -31,6 +33,26 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(self.bin.exists())
         self.assertFalse(self.skills.exists())
+
+    def test_home_lookup_is_lazy_and_missing_defaults_return_safe_errors(self):
+        spec = importlib.util.spec_from_file_location('vault_installer_home', ROOT / 'Scripts/install.py')
+        installer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(installer)
+        for explicit in (True, False):
+            with self.subTest(explicit=explicit):
+                output, errors = io.StringIO(), io.StringIO()
+                args = ['--bin-dir', str(self.bin), '--skills-dir', str(self.skills)] if explicit else []
+                with mock.patch.object(Path, 'home', side_effect=RuntimeError('synthetic private diagnostic')), \
+                     contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                    status = installer.main(args)
+                self.assertEqual(status, 0 if explicit else 2)
+                if explicit:
+                    self.assertFalse(json.loads(output.getvalue())['executed'])
+                else:
+                    self.assertIn('home', errors.getvalue().lower())
+                    self.assertNotIn('synthetic private diagnostic', errors.getvalue())
+                self.assertFalse(self.bin.exists())
+                self.assertFalse(self.skills.exists())
 
     def test_install_launchers_work_and_reinstall_is_idempotent(self):
         for _ in range(2):

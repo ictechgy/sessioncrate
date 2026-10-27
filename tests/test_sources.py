@@ -3,10 +3,12 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
+from codex_vault import bundles
 from codex_vault.sources import (
     SessionGroup,
     default_source_root,
@@ -47,6 +49,50 @@ class SourceAdapterTests(unittest.TestCase):
         self.assertEqual({item["default_root"] for item in diagnostic.values()}, {None})
         with mock.patch.dict(os.environ, {"GEMINI_CLI_HOME": "/tmp/gemini-fixture"}, clear=False):
             self.assertEqual(default_source_root("gemini"), Path("/tmp/gemini-fixture/.gemini"))
+
+    def test_configured_default_roots_do_not_require_the_user_home(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            cases = (
+                ("codex", "CODEX_HOME", base / "codex", base / "codex"),
+                ("claude", "CLAUDE_CONFIG_DIR", base / "claude", base / "claude"),
+                ("grok", "GROK_HOME", base / "grok", base / "grok"),
+                ("gemini", "GEMINI_CLI_HOME", base / "gemini-home", base / "gemini-home" / ".gemini"),
+            )
+            for tool, variable, configured, expected in cases:
+                with self.subTest(tool=tool):
+                    with mock.patch.dict(os.environ, {variable: str(configured)}, clear=True):
+                        with mock.patch.object(Path, "home", side_effect=RuntimeError("synthetic unavailable home")):
+                            self.assertEqual(default_source_root(tool), expected)
+
+    def test_unavailable_home_is_reported_as_a_sanitized_source_error(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch.object(Path, "home", side_effect=RuntimeError("synthetic private home failure")):
+                for operation in (
+                    lambda: default_source_root("codex"),
+                    tool_catalog,
+                ):
+                    with self.subTest(operation=operation):
+                        with self.assertRaises(VaultError) as raised:
+                            operation()
+                        self.assertIn("source root", str(raised.exception))
+                        self.assertNotIn("private", str(raised.exception))
+
+    def test_export_discovery_and_scan_fail_closed_when_home_is_unavailable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "exports"
+            root.mkdir()
+            (root / "chat.jsonl").write_text('{}\n', encoding="utf-8")
+            with mock.patch.object(Path, "home", side_effect=RuntimeError("synthetic private home failure")):
+                for operation in (
+                    lambda: discover("agy", root),
+                    lambda: bundles.scan("agy", root, older_than_days=0),
+                ):
+                    with self.subTest(operation=operation):
+                        with self.assertRaises(VaultError) as raised:
+                            operation()
+                        self.assertIn("export source root", str(raised.exception))
+                        self.assertNotIn("private", str(raised.exception))
 
     def test_diagnostic_discovery_is_flat_scoped_and_marks_symlinks(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -203,6 +249,97 @@ class SourceAdapterTests(unittest.TestCase):
             (encoded / "updates.jsonl").write_text('{}\n', encoding="utf-8")
             encoded_group = next(item for item in discover("grok", root) if item.session_id == "session-2")
             self.assertEqual(encoded_group.cwd, "/work/app")
+
+    def test_grok_recovery_artifacts_are_visible_but_never_archived(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / "grok"
+            project = root / "sessions" / "repo"
+            healthy = project / "healthy"
+            nested = project / "nested-artifact"
+            quarantine = project / ".codex-vault-pending-bundle-deadbeef"
+            healthy.mkdir(parents=True)
+            nested.mkdir()
+            quarantine.mkdir()
+            (healthy / "updates.jsonl").write_text('{}\n', encoding="utf-8")
+            (nested / "updates.jsonl").write_text('{}\n', encoding="utf-8")
+            (nested / ".bundle-restore-deadbeef").write_bytes(b"recovery plaintext")
+            (quarantine / "updates.jsonl").write_text('{"retained":true}\n', encoding="utf-8")
+
+            old = time.time_ns() - 2 * 86_400 * 1_000_000_000
+            for current, directories, files in os.walk(root, topdown=False):
+                for name in files:
+                    os.utime(Path(current) / name, ns=(old, old))
+                for name in directories:
+                    os.utime(Path(current) / name, ns=(old, old))
+            os.utime(root, ns=(old, old))
+
+            scanned = bundles.scan("grok", root, older_than_days=1)
+            candidates = scanned["candidates"]
+            healthy_candidate = next(item for item in candidates if item["session_id"] == "healthy")
+            nested_candidate = next(item for item in candidates if item["session_id"] == "nested-artifact")
+            warnings = [item for item in candidates if item["session_id"].startswith("discovery-warning:")]
+            nested_group = next(item for item in discover("grok", root) if item.session_id == "nested-artifact")
+
+            self.assertTrue(healthy_candidate["eligible"])
+            self.assertFalse(nested_candidate["eligible"])
+            self.assertTrue(any("reserved SessionCrate recovery artifact" in note for note in nested_group.notes))
+            self.assertEqual(nested_group.files, ("sessions/repo/nested-artifact/updates.jsonl",))
+            self.assertEqual(len(warnings), 1)
+            self.assertFalse(warnings[0]["eligible"])
+            self.assertEqual(warnings[0]["root_entries"], [])
+            self.assertIn("reserved SessionCrate recovery artifact", warnings[0]["reason"])
+            self.assertFalse(any("deadbeef" in path for item in candidates for path in item["files"]))
+
+            archived = bundles.archive(
+                "grok", root, base / "vault", older_than_days=1, execute=True
+            )
+
+            self.assertEqual([item["session_id"] for item in archived["archived"]], ["healthy"])
+            self.assertTrue(quarantine.is_dir())
+            self.assertTrue((nested / ".bundle-restore-deadbeef").is_file())
+
+    def test_reserved_recovery_artifacts_make_native_walks_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+
+            claude_root = base / "claude"
+            claude_project = claude_root / "projects" / "repo"
+            claude_sidecar = claude_project / "session-a"
+            claude_sidecar.mkdir(parents=True)
+            (claude_project / "session-a.jsonl").write_text('{}\n', encoding="utf-8")
+            (claude_sidecar / ".tool-companion").write_text("keep", encoding="utf-8")
+            restore_stage = claude_sidecar / ".codex-vault-restore-stage-deadbeef"
+            restore_stage.mkdir()
+            (restore_stage / "plaintext.jsonl").write_text('{"private":true}\n', encoding="utf-8")
+            (claude_sidecar / ".vault-restore-deadbeef").write_text("recovery plaintext", encoding="utf-8")
+
+            claude_group = discover("claude", claude_root)[0]
+
+            self.assertIn("projects/repo/session-a/.tool-companion", claude_group.files)
+            self.assertFalse(any("restore-stage" in path for path in claude_group.files))
+            self.assertFalse(any("vault-restore" in path for path in claude_group.files))
+            self.assertFalse(claude_group.removable)
+            self.assertTrue(any("reserved SessionCrate recovery artifact" in note for note in claude_group.notes))
+
+            codex_root = base / "codex"
+            codex_scope = codex_root / "sessions" / "2026" / "10"
+            codex_scope.mkdir(parents=True)
+            (codex_scope / "rollout-healthy.jsonl").write_text('{}\n', encoding="utf-8")
+            pending = codex_scope / ".codex-vault-pending-deadbeef"
+            pending.mkdir()
+            (pending / "rollout-retained.jsonl").write_text('{"private":true}\n', encoding="utf-8")
+
+            codex_groups = discover("codex", codex_root)
+
+            healthy_group = next(group for group in codex_groups if group.session_id == "rollout-healthy")
+            warning = next(group for group in codex_groups if group.session_id.startswith("discovery-warning:"))
+            self.assertTrue(healthy_group.removable)
+            self.assertEqual(healthy_group.files, ("sessions/2026/10/rollout-healthy.jsonl",))
+            self.assertEqual(warning.root_entries, ())
+            self.assertFalse(warning.removable)
+            self.assertTrue(any("reserved SessionCrate recovery artifact" in note for note in warning.notes))
+            self.assertFalse(any("rollout-retained" in path for group in codex_groups for path in group.files))
 
     def test_native_discovery_keeps_healthy_siblings_when_project_is_unreadable(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -585,6 +722,88 @@ class SourceAdapterTests(unittest.TestCase):
         self.assertTrue(any("tool state output" in record["text"] for record in state if "text" in record))
         chat_list = list(iter_text_records(io.BytesIO(json.dumps([{"role": "user", "content": "list chat"}]).encode()), "common-json"))
         self.assertEqual(chat_list[0]["text"], "list chat")
+
+    def test_structured_tool_arguments_hide_credential_keys_without_false_positives(self):
+        long_benign_key = "_".join(["token"] * 1024 + ["count"])
+        long_sensitive_key = "_".join(["token"] * 1024 + ["access"])
+        arguments = {
+            "path": "src/visible.txt",
+            "tokenizer": "visible-tokenizer",
+            "token_count": 37,
+            "secretary": "visible-secretary",
+            "apiKey": "SENSITIVE_API_KEY",
+            "request-headers": {
+                "Authorization": "SENSITIVE_AUTHORIZATION",
+                "X-Trace": "SENSITIVE_HEADER_CHILD",
+            },
+            "userCredentials": {
+                "username": "SENSITIVE_CREDENTIAL_USER",
+                "password": "SENSITIVE_PASSWORD",
+            },
+            "sessionCookie": "SENSITIVE_COOKIE",
+            "client_secret": "SENSITIVE_CLIENT_SECRET",
+            "accessToken": "SENSITIVE_ACCESS_TOKEN",
+            long_benign_key: "visible-long-token-count",
+            long_sensitive_key: "SENSITIVE_LONG_ACCESS_TOKEN",
+        }
+        records = (
+            (
+                "claude-jsonl",
+                {"type": "assistant", "message": {"content": [
+                    {"type": "tool_use", "name": "read_file", "input": arguments},
+                ]}},
+            ),
+            (
+                "grok-acp-jsonl",
+                {"update": {"sessionUpdate": {
+                    "kind": "tool_call", "title": "read_file", "rawInput": arguments,
+                }}},
+            ),
+            (
+                "common-json",
+                {"type": "tool", "toolCalls": [
+                    {"name": "read_file", "arguments": arguments},
+                ]},
+            ),
+        )
+
+        encoded_by_format: dict[str, bytes] = {}
+        for format_name, record in records:
+            with self.subTest(format=format_name):
+                raw = (json.dumps(record, ensure_ascii=False) + "\n").encode()
+                stream = io.BytesIO(raw)
+                readable = list(iter_text_records(stream, format_name))
+                text = " ".join(item["text"] for item in readable if "text" in item)
+                encoded_by_format[format_name] = raw
+
+                self.assertNotIn("SENSITIVE_", text)
+                for expected in (
+                    "src/visible.txt", "visible-tokenizer", "37",
+                    "visible-secretary", "visible-long-token-count",
+                ):
+                    self.assertIn(expected, text)
+                self.assertEqual(stream.getvalue(), raw)
+
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            source_root = base / "grok"
+            source = source_root / "sessions" / "repo" / "session-privacy" / "updates.jsonl"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(encoded_by_format["grok-acp-jsonl"])
+            archived = bundles.archive(
+                "grok", source_root, base / "vault", older_than_days=0, execute=True
+            )
+            self.assertEqual(len(archived["archived"]), 1)
+            self.assertEqual(source.read_bytes(), encoded_by_format["grok-acp-jsonl"])
+
+            bundles.restore(
+                base / "vault",
+                archived["archived"][0]["archive_id"],
+                base / "restored",
+                execute=True,
+            )
+            restored = base / "restored" / "sessions" / "repo" / "session-privacy" / "updates.jsonl"
+            self.assertEqual(restored.read_bytes(), encoded_by_format["grok-acp-jsonl"])
 
     def test_model_io_records_extract_known_text_without_dumping_sensitive_fields(self):
         lines = [
